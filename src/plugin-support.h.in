@@ -1,0 +1,18 @@
+/*
+ * plugin-support.h.in — name/version macros injected by CMake.
+ *
+ * This file is configured into <build>/generated/plugin-support.h; sources
+ * include "plugin-support.h" (the generated dir is on the include path).
+ */
+#pragma once
+
+/* Runtime module name (must match binary basename / locale data dir). */
+#define HDRP_MODULE_NAME   "@HDRP_MODULE_NAME@"
+#define HDRP_VERSION       "@PROJECT_VERSION@"
+
+/* OBS source id registered by this plugin. */
+#define HDRP_SOURCE_ID     "hdr_playlist_source"
+
+/* Minimum OBS semantic version: 31.0.0 (P010 HDR + modern media controls).
+ * libobs encodes versions as (major<<24)|(minor<<16)|(patch<<8). */
+#define HDRP_MIN_OBS_VERSION ((31u << 24) | (0u << 16) | (0u << 8))

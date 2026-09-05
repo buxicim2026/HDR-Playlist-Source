@@ -1,0 +1,18 @@
+# Build output
+build/
+release/
+cmake-build-*/
+
+# OBS SDK fetched by packaging scripts
+*.lib
+*.def
+
+# Editor / OS
+.vscode/
+.idea/
+*.user
+.DS_Store
+Thumbs.db
+
+# Generated files
+src/plugin-support.h.generated
