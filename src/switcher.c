@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include <obs.h>
+#include <obs-module.h>
 #include <graphics/graphics.h>
 #include <util/bmem.h>
 
@@ -156,9 +157,11 @@ struct hdrp_switcher {
 	struct xfade xf;
 	int xfade_ms;
 	bool xfade_active;
-	bool xfade_supported;   /* effect file present & HDR-safe conditions */
+	bool xf_supported;      /* effect file loaded */
 	double xfade_elapsed;   /* seconds into the crossfade */
 	int xf_tex_valid;
+	int xf_tex_w;           /* texrender size currently allocated */
+	int xf_tex_h;
 	gs_texrender_t *xf_tex[2]; /* [0]=outgoing(old) [1]=incoming(new) */
 };
 
@@ -252,17 +255,18 @@ void hdrp_switcher_destroy(struct hdrp_switcher *sw)
 
 static void xf_texrender_ensure(struct hdrp_switcher *sw, int w, int h)
 {
+	if (w == sw->xf_tex_w && h == sw->xf_tex_h && sw->xf_tex[0] &&
+	    sw->xf_tex[1])
+		return;
 	for (int i = 0; i < 2; i++) {
 		if (sw->xf_tex[i]) {
-			uint32_t tw = gs_texrender_get_width(sw->xf_tex[i]);
-			uint32_t th = gs_texrender_get_height(sw->xf_tex[i]);
-			if ((int)tw == w && (int)th == h)
-				continue;
 			gs_texrender_destroy(sw->xf_tex[i]);
 			sw->xf_tex[i] = NULL;
 		}
 		sw->xf_tex[i] = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	}
+	sw->xf_tex_w = w;
+	sw->xf_tex_h = h;
 }
 
 static void render_child_to_tex(struct hdrp_switcher *sw, obs_source_t *child,
@@ -309,19 +313,13 @@ static bool draw_xfade(struct hdrp_switcher *sw, obs_source_t *outgoing,
 	return true;
 }
 
-/* Is the current canvas HDR? If so we refuse a crossfade because an 8-bit
- * intermediate texture would clamp PQ values. */
+/* A crossfade is only safe on a plain sRGB canvas: the intermediate texrender
+ * is 8-bit and would clamp PQ/wide-gamut values on an HDR canvas. Be
+ * conservative and treat every non-sRGB canvas (PQ/HLG/709-EXTENDED/…) as
+ * HDR so we never crush highlights. */
 static bool canvas_is_hdr(void)
 {
-	switch (gs_get_color_space()) {
-	case GS_CS_2100_PQ:
-	case GS_CS_2100_HLG:
-	case GS_CS_709_EXTENDED:
-	case GS_CS_709_SCRGB:
-		return true;
-	default:
-		return false;
-	}
+	return gs_get_color_space() != GS_CS_SRGB;
 }
 
 /* ------------------------------------------------------------------ */

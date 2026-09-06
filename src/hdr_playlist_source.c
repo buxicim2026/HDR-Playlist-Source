@@ -15,6 +15,7 @@
 #include <string.h>
 
 #include <obs.h>
+#include <obs-module.h>
 #include <util/bmem.h>
 #include <util/platform.h>
 
