@@ -19,7 +19,6 @@
 
 #include <obs.h>
 #include <graphics/graphics.h>
-#include <graphics/texrender.h>
 #include <util/bmem.h>
 
 #include "switcher.h"
