@@ -190,7 +190,6 @@ static void hdrp_start_current(struct hdr_playlist *p)
 	hdrp_attach_active_audio(p);
 
 	obs_source_media_started(p->source);
-	obs_source_media_play(p->source);
 	p->need_preload_retry = true;
 }
 
@@ -199,8 +198,8 @@ static void hdrp_stop_playback(struct hdr_playlist *p, bool emit_stopped)
 	hdrp_audio_detach_current(p->au);
 	hdrp_switcher_stop(p->sw);
 	p->stopped = true;
-	if (emit_stopped)
-		obs_source_media_stopped(p->source);
+	/* Stop state is reported through hdrp_media_get_state(). */
+	(void)emit_stopped;
 }
 
 /* Clip ended and the playlist has no more entries: become idle. */
@@ -258,7 +257,6 @@ static void hdrp_switcher_ended(void *opaque)
 		/* Promote happened: new clip is running. */
 		hdrp_on_clip_boundary(p);
 		obs_source_media_started(p->source);
-		obs_source_media_play(p->source);
 		p->need_preload_retry = true;
 		return;
 	}
@@ -283,7 +281,6 @@ static void hdrp_switcher_ended(void *opaque)
 	hdrp_switcher_play(p->sw, path, &opts);
 	hdrp_attach_active_audio(p);
 	obs_source_media_started(p->source);
-	obs_source_media_play(p->source);
 	p->need_preload_retry = true;
 }
 
@@ -691,15 +688,12 @@ static void hdrp_media_play_pause(void *data, bool pause)
 		return;
 	enum obs_media_state st = hdrp_switcher_get_state(p->sw);
 	if (pause) {
-		if (st == OBS_MEDIA_STATE_PLAYING) {
+		if (st == OBS_MEDIA_STATE_PLAYING)
 			hdrp_switcher_set_paused(p->sw, true);
-			obs_source_media_pause(p->source);
-		}
 		return;
 	}
 	if (st == OBS_MEDIA_STATE_PAUSED) {
 		hdrp_switcher_set_paused(p->sw, false);
-		obs_source_media_play(p->source);
 	} else if (p->stopped) {
 		hdrp_start_current(p);
 	} else if (st == OBS_MEDIA_STATE_STOPPED ||
