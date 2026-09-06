@@ -8,6 +8,7 @@
 
 #include <obs-module.h>
 
+#include "hdr_playlist_source.h"
 #include "plugin-support.h"
 
 /* OBS encodes the runtime version as (major<<24)|(minor<<16)|(patch<<8). */
@@ -30,8 +31,7 @@ bool obs_module_load(void)
 		     "HDR/gapless features may misbehave");
 	}
 
-	/* The source type is registered by hdr_playlist_source.c once that
-	 * module is linked in. */
+	hdrp_register_sources();
 	return true;
 }
 

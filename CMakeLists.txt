@@ -26,7 +26,12 @@ endif()
 find_package(LibObs REQUIRED)
 
 set(HDRP_SOURCES
-  src/plugin-main.c)
+  src/plugin-main.c
+  src/playlist.c
+  src/util.c
+  src/switcher.c
+  src/audio.c
+  src/hdr_playlist_source.c)
 
 set(HDRP_MODULE_NAME "HDR-Playlist-Source")
 configure_file(
