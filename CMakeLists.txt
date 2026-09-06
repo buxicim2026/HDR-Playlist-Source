@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16...3.28)
 
-project(HDR-Playlist-Source VERSION 0.0.1 LANGUAGES C)
+project(HDR-Playlist-Source VERSION 0.0.2 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)

@@ -90,3 +90,4 @@ bool hdrp_switcher_consume_promote_event(struct hdrp_switcher *sw);
 /* Exposed so hdrp_playlist_source.c can attach its audio capture callbacks. */
 obs_source_t *hdrp_switcher_active_child(const struct hdrp_switcher *sw);
 obs_source_t *hdrp_switcher_idle_child(const struct hdrp_switcher *sw);
+void hdrp_switcher_idle_stop_if_playing(struct hdrp_switcher *sw);

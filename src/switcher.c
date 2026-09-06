@@ -516,6 +516,21 @@ obs_source_t *hdrp_switcher_idle_child(const struct hdrp_switcher *sw)
 	return sw->slot[1 - sw->active_idx];
 }
 
+/* Release the inactive slot when low-memory mode is on and nothing is
+ * parked there. */
+void hdrp_switcher_idle_stop_if_playing(struct hdrp_switcher *sw)
+{
+	if (!sw || sw->active_idx < 0 || sw->preload_idx >= 0)
+		return;
+	obs_source_t *idle = sw->slot[1 - sw->active_idx];
+	if (!idle)
+		return;
+	enum obs_media_state st = obs_source_media_get_state(idle);
+	if (st == OBS_MEDIA_STATE_PLAYING ||
+	    st == OBS_MEDIA_STATE_PAUSED)
+		obs_source_media_stop(idle);
+}
+
 /* Force a switch now (manual next/previous, or any seek to a specific file).
  * If a matching preload is ready it is used (no gap); otherwise this stops the
  * current clip and starts `path` on the active slot. */

@@ -493,16 +493,40 @@ static void hdrp_show(void *data)
 	if (!p)
 		return;
 
+	if (p->stopped && hdrp_playlist_count(p->pl) > 0) {
+		/* The source just became visible and nothing is playing yet.
+		 * Honour the visibility policy: STOP_NEXT jumps to the next
+		 * entry, every other mode simply restarts the current one.
+		 * This covers the user-reported "source added but black" case
+		 * where the scene had been visible all along in preview and
+		 * our `show` had been called before any file was added. */
+		if (p->visibility == VIS_STOP_NEXT)
+			hdrp_jump(p, true);
+		else
+			hdrp_start_current(p);
+		return;
+	}
+
 	if (p->visibility == VIS_PAUSE_RESUME && !p->stopped) {
 		hdrp_switcher_set_paused(p->sw, false);
 		return;
 	}
-	if (p->visibility == VIS_STOP_NEXT) {
-		hdrp_jump(p, true);
+}
+
+/* `activate` fires when the source becomes part of an active scene (i.e.
+ * when the user actually starts streaming/recording). This is the most
+ * reliable trigger to ensure playback starts even when the source has
+ * been idle in preview for a long time. */
+static void hdrp_activate(void *data)
+{
+	struct hdr_playlist *p = data;
+	if (!p)
 		return;
-	}
-	if (p->visibility == VIS_STOP_RESTART && p->stopped)
-		hdrp_start_current(p);
+	if (hdrp_playlist_count(p->pl) == 0)
+		return;
+	if (!p->stopped)
+		return;
+	hdrp_start_current(p);
 }
 
 static void hdrp_hide(void *data)
@@ -538,6 +562,11 @@ static void hdrp_video_tick(void *data, float seconds)
 		p->need_preload_retry = false;
 		hdrp_try_preload_next(p);
 	}
+
+	/* Low-memory mode: drop the inactive decoder whenever it isn't
+	 * needed for gapless preloading. */
+	if (p->low_memory && !p->stopped)
+		hdrp_switcher_idle_stop_if_playing(p->sw);
 }
 
 static void hdrp_video_render(void *data, gs_effect_t *effect)
@@ -593,6 +622,19 @@ static void hdrp_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, KEY_VISIBILITY, VIS_STOP_RESTART);
 	obs_data_set_default_int(settings, KEY_MIXED, MIXED_AUTO);
 	obs_data_set_default_int(settings, KEY_SAVED_INDEX, -1);
+}
+
+/* "Play now" / "立即切换" button — kicks playback off in any situation
+ * (preview-only, stuck state, after settings change, etc.). */
+static bool hdrp_play_now_clicked(obs_properties_t *props,
+				  obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(property);
+	struct hdr_playlist *p = data;
+	if (p)
+		hdrp_start_current(p);
+	return false;
 }
 
 static obs_properties_t *hdrp_properties(void *data)
@@ -674,6 +716,10 @@ static obs_properties_t *hdrp_properties(void *data)
 					obs_module_text("AddFolderHint"));
 	obs_property_set_enabled(folder, false);
 
+	obs_properties_add_button(props, "hdrp_play_now",
+				  obs_module_text("PlayNow"),
+				  hdrp_play_now_clicked);
+
 	return props;
 }
 
@@ -694,12 +740,12 @@ static void hdrp_media_play_pause(void *data, bool pause)
 	}
 	if (st == OBS_MEDIA_STATE_PAUSED) {
 		hdrp_switcher_set_paused(p->sw, false);
-	} else if (p->stopped) {
-		hdrp_start_current(p);
-	} else if (st == OBS_MEDIA_STATE_STOPPED ||
-		   st == OBS_MEDIA_STATE_ENDED) {
-		hdrp_start_current(p);
+		return;
 	}
+	/* Any non-paused state (including STOPPED / ENDED / "no active
+	 * child") should kick off playback — this is what the media dock's
+	 * "Play" button ends up calling. */
+	hdrp_start_current(p);
 }
 
 static void hdrp_media_restart(void *data)
@@ -789,6 +835,7 @@ static const struct obs_source_info hdrp_source_info = {
 	.save = hdrp_save,
 	.show = hdrp_show,
 	.hide = hdrp_hide,
+	.activate = hdrp_activate,
 	.video_tick = hdrp_video_tick,
 	.video_render = hdrp_video_render,
 	.video_get_color_space = hdrp_video_get_color_space,
