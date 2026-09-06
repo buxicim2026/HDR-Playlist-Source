@@ -14,6 +14,7 @@
  * tick() consumes on the video thread.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include <obs.h>
@@ -41,15 +42,6 @@ static void make_base_settings(obs_data_t *s)
 	obs_data_set_bool(s, "close_when_inactive", false);
 	obs_data_set_bool(s, "clear_on_media_end", false);
 	obs_data_set_bool(s, "log_changes", false);
-}
-
-static void apply_opts_to_settings(obs_data_t *s, const char *path,
-				   const struct hdrp_switcher_opts *opts)
-{
-	obs_data_set_string(s, "local_file", path ? path : "");
-	obs_data_set_bool(s, "hw_decode", opts->hw_decode);
-	obs_data_set_int(s, "speed_percent", opts->speed_percent);
-	obs_data_set_int(s, "color_range", VIDEO_RANGE_DEFAULT);
 }
 
 static obs_source_t *create_slot(obs_source_t *parent, int idx,
@@ -362,7 +354,11 @@ bool hdrp_switcher_play(struct hdrp_switcher *sw, const char *path,
 {
 	if (!sw || !path || !*path)
 		return false;
-	if (sw->active_idx < 0 || !sw->slot[sw->active_idx])
+
+	/* After stop() there is no active slot yet; take slot 0. */
+	if (sw->active_idx < 0)
+		sw->active_idx = 0;
+	if (!sw->slot[sw->active_idx])
 		return false;
 
 	/* Stop whatever may still be running on the active slot. */
