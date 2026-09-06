@@ -288,14 +288,14 @@ static void xf_texrender_release(struct hdrp_switcher *sw)
 	sw->xf_tex_valid = 0;
 }
 
-/* Intermediate space/format for the fade: on an HDR canvas we need a 16F
- * buffer in 709-extended space, otherwise PQ highlights get clamped. On a
- * plain sRGB canvas OBS's own 8-bit path is used (exactly what the built-in
- * fade transition does). */
+/* Intermediate space/format for the fade: simply mirror the space we are
+ * currently being rendered into (OBS 31 has only SRGB / SRGB_16F /
+ * 709_EXTENDED / 709_SCRGB; HDR canvases are the last two). This way the
+ * fade intermediate matches the compositor's expectations and each child is
+ * converted by OBS itself into that space. */
 static enum gs_color_space xf_space(void)
 {
-	return gs_get_color_space() == GS_CS_SRGB ? GS_CS_SRGB
-						  : GS_CS_709_EXTENDED;
+	return gs_get_color_space();
 }
 
 static void xf_texrender_ensure(struct hdrp_switcher *sw, int w, int h,
@@ -361,7 +361,7 @@ static bool draw_xfade(struct hdrp_switcher *sw, obs_source_t *outgoing,
 {
 	const enum gs_color_space space = xf_space();
 	const bool hdr = space != GS_CS_SRGB;
-	const enum gs_color_format fmt = hdr ? GS_RGBA16F : GS_RGBA;
+	const enum gs_color_format fmt = gs_get_format_from_space(space);
 
 	int tw, th;
 	xf_size(w, h, &tw, &th);
@@ -839,8 +839,8 @@ hdrp_switcher_get_color_space(struct hdrp_switcher *sw, size_t count,
  *
  * We cannot simply forward obs_source_get_color_space(): for async sources
  * libobs returns the last entry of `preferred_spaces` when none of them
- * matches, so on an HDR canvas an SDR clip would be reported as
- * GS_CS_2100_PQ and OBS would skip its SDR -> HDR conversion.
+ * matches, so on an HDR canvas an SDR clip would be reported as HDR and OBS
+ * would skip its SDR -> HDR conversion.
  *
  * Instead we probe: asking for [C, X] returns C if and only if the child's
  * real space is C (libobs only breaks early on an exact match). */
@@ -855,15 +855,15 @@ hdrp_switcher_content_space(struct hdrp_switcher *sw, size_t count,
 		return (count > 0 && preferred) ? preferred[0] : GS_CS_SRGB;
 
 	static const enum gs_color_space cands[] = {
-		GS_CS_SRGB,        GS_CS_SRGB_16F,  GS_CS_709_EXTENDED,
-		GS_CS_709_SCRGB,   GS_CS_2100_PQ,   GS_CS_2100_HLG,
+		GS_CS_SRGB,      GS_CS_SRGB_16F,
+		GS_CS_709_EXTENDED, GS_CS_709_SCRGB,
 	};
 	const size_t n = sizeof(cands) / sizeof(cands[0]);
 
 	for (size_t i = 0; i < n; i++) {
 		const enum gs_color_space c = cands[i];
 		const enum gs_color_space other =
-			(c == GS_CS_SRGB) ? GS_CS_2100_PQ : GS_CS_SRGB;
+			(c == GS_CS_SRGB) ? GS_CS_709_EXTENDED : GS_CS_SRGB;
 		const enum gs_color_space pref[2] = {c, other};
 		if (obs_source_get_color_space(child, 2, pref) == c)
 			return c;

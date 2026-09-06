@@ -657,20 +657,22 @@ hdrp_video_get_color_space(void *data, size_t count,
 
 	/* Report what the media actually *is*, not what the canvas would like
 	 * it to be. Forwarding obs_source_get_color_space() would let libobs'
-	 * async fallback label an SDR clip as GS_CS_2100_PQ on an HDR canvas
-	 * (it returns the last preferred space when nothing matches), which
-	 * makes OBS skip the SDR -> HDR conversion and shifts the colors.
+	 * async fallback label an SDR clip as HDR on an HDR canvas (it returns
+	 * the last preferred space when nothing matches), which makes OBS skip
+	 * the SDR -> HDR conversion and shifts the colors.
+	 *
+	 * OBS 31 only distinguishes SDR (GS_CS_SRGB) from HDR (GS_CS_709_*);
+	 * PQ vs HLG is decided by OBS's own output settings, not per source,
+	 * so the two "force" entries below map to the same HDR presentation.
 	 *
 	 * Policy:
-	 *   auto     -> SDR stays SDR, HDR stays HDR (no forced conversion)
-	 *   force PQ -> always advertise Rec.2100 PQ
-	 *   force SDR-> always advertise sRGB (let OBS tonemap/expand) */
+	 *   auto        -> SDR stays SDR, HDR stays HDR (no forced conversion)
+	 *   force PQ/HLG-> always advertise HDR (709-extended, 16F)
+	 *   force SDR   -> always advertise sRGB (let OBS tonemap/expand) */
 	if (p->mixed == MIXED_FORCE_SDR)
 		return GS_CS_SRGB;
-	if (p->mixed == MIXED_FORCE_PQ)
-		return GS_CS_2100_PQ;
-	if (p->mixed == MIXED_FORCE_HLG)
-		return GS_CS_2100_HLG;
+	if (p->mixed == MIXED_FORCE_PQ || p->mixed == MIXED_FORCE_HLG)
+		return GS_CS_709_EXTENDED;
 
 	return hdrp_switcher_content_space(p->sw, count, preferred_spaces);
 }
