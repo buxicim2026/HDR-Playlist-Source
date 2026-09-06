@@ -11,6 +11,7 @@
 #       - macOS   : nothing (-undefined dynamic_lookup handles it)
 #
 # Usage:
+#   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 #   find_package(LibObs REQUIRED)
 #   target_link_libraries(<target> PRIVATE LibObs::LibObs)
 #
@@ -38,13 +39,7 @@ if(NOT LIBOBS_INCLUDE_DIR OR NOT EXISTS "${LIBOBS_INCLUDE_DIR}/obs-module.h")
     "(headers only, no OBS build required).")
 endif()
 
-# --- 2. Link target -------------------------------------------------------
-add_library(LibObs::LibObs UNKNOWN IMPORTED)
-set_target_properties(LibObs::LibObs PROPERTIES
-  IMPORTED_LOCATION "${LIBOBS_INCLUDE_DIR}")
-
-# Platform-specific linker inputs are kept as plain variables so CMakeLists
-# can append them; the imported target simply signals "headers available".
+# --- 2. Linker input ------------------------------------------------------
 if(WIN32 AND NOT OBS_IMPORT_LIB)
   message(FATAL_ERROR
     "OBS_IMPORT_LIB not set. Generate obs.lib from obs.dll with "
@@ -54,6 +49,14 @@ if(UNIX AND NOT APPLE AND NOT OBS_STUB_LIB)
   message(FATAL_ERROR
     "OBS_STUB_LIB not set. Create a stub libobs.so with soname libobs.so.0 "
     "(see scripts/package-plugin.sh).")
+endif()
+
+# Interface target carrying the headers only; platform linker inputs are added
+# by the top-level CMakeLists (obs.lib / libobs stub / dynamic_lookup).
+if(NOT TARGET LibObs::LibObs)
+  add_library(LibObs::LibObs INTERFACE IMPORTED GLOBAL)
+  set_target_properties(LibObs::LibObs PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${LIBOBS_INCLUDE_DIR}")
 endif()
 
 set(LibObs_FOUND TRUE)

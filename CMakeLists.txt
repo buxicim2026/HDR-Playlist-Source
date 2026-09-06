@@ -23,6 +23,7 @@ endif()
 #
 #   macOS uses -undefined dynamic_lookup and needs nothing extra.
 # ---------------------------------------------------------------------------
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(LibObs REQUIRED)
 
 set(HDRP_SOURCES
