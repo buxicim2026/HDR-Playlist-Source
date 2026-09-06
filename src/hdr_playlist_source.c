@@ -84,6 +84,7 @@ static void hdrp_start_current(struct hdr_playlist *p);
 static void hdrp_stop_playback(struct hdr_playlist *p, bool emit_stopped);
 static void hdrp_try_preload_next(struct hdr_playlist *p);
 static void hdrp_on_clip_boundary(struct hdr_playlist *p);
+static void hdrp_update(void *data, obs_data_t *settings);
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -632,14 +633,14 @@ static obs_properties_t *hdrp_properties(void *data)
 		props, KEY_SPEED, obs_module_text("Speed"), 1, 200, 1);
 	obs_property_int_set_suffix(speed, "%");
 
+	obs_properties_t *gcontent = obs_properties_create();
+	obs_property_t *dur = obs_properties_add_int(
+		gcontent, KEY_TRANSITION_MS,
+		obs_module_text("TransitionDuration"), 0, 2000, 50);
+	obs_property_int_set_suffix(dur, " ms");
 	obs_properties_add_group(props, KEY_USE_TRANSITION,
 				 obs_module_text("Transition"),
-				 OBS_GROUP_CHECKABLE);
-	obs_property_t *grp = obs_properties_get(props, KEY_USE_TRANSITION);
-	obs_properties_add_int(obs_property_group_content(grp),
-			       KEY_TRANSITION_MS,
-			       obs_module_text("TransitionDuration"), 0, 2000,
-			       50);
+				 OBS_GROUP_CHECKABLE, gcontent);
 
 	obs_property_t *low =
 		obs_properties_add_bool(props, KEY_LOW_MEMORY,

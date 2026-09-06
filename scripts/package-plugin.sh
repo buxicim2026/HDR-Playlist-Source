@@ -32,7 +32,7 @@ esac
 step() { printf '\n==> %s\n' "$1"; }
 
 # Version straight from CMakeLists.txt project(... VERSION x.y.z).
-version="$(sed -n 's/^project(HDR-Playlist-Source VERSION \([0-9][0-9.]*\)).*/\1/p' "$root/CMakeLists.txt" | head -n1)"
+version="$(sed -n 's/^project(HDR-Playlist-Source VERSION \([0-9][0-9.]*\).*/\1/p' "$root/CMakeLists.txt" | head -n1)"
 if [ -z "$version" ]; then
     echo "could not read version from CMakeLists.txt" >&2
     exit 1

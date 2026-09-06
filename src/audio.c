@@ -19,6 +19,9 @@
 #include "audio.h"
 
 #define HDRP_FADE_NS (15 * 1000000LL) /* 15 ms de-click ramp */
+/* libobs bounds: obs_source_audio.data[] is MAX_AV_PLANES (8) entries and a
+ * speaker layout never exceeds 8 channels. */
+#define HDRP_PLANES_MAX 8
 
 struct hdrp_audio {
 	obs_source_t *parent;
@@ -37,12 +40,12 @@ static void on_audio_capture(void *param, obs_source_t *source,
 
 	const enum speaker_layout layout = obs_source_get_speaker_layout(source);
 	const size_t channels = get_audio_channels(layout);
-	if (channels == 0 || channels > MAX_AUDIO_PLANES)
+	if (channels == 0 || channels > HDRP_PLANES_MAX)
 		return;
 
 	const size_t frames = audio->frames;
 
-	const float *planes[MAX_AUDIO_PLANES];
+	const float *planes[HDRP_PLANES_MAX];
 	for (size_t c = 0; c < channels; c++) {
 		planes[c] = (const float *)audio->data[c];
 		if (!planes[c])
@@ -50,7 +53,7 @@ static void on_audio_capture(void *param, obs_source_t *source,
 	}
 
 	/* Snapshot so our output pointers stay valid for libobs. */
-	float *copy[MAX_AUDIO_PLANES];
+	float *copy[HDRP_PLANES_MAX];
 	for (size_t c = 0; c < channels; c++) {
 		copy[c] = bmalloc(frames * sizeof(float));
 		memcpy(copy[c], planes[c], frames * sizeof(float));
@@ -78,7 +81,7 @@ static void on_audio_capture(void *param, obs_source_t *source,
 	struct obs_source_audio out;
 	memset(&out, 0, sizeof(out));
 	for (size_t c = 0; c < channels; c++)
-		out.data[c] = copy[c];
+		out.data[c] = (uint8_t *)copy[c];
 	out.frames = (uint32_t)frames;
 	out.speakers = layout;
 	out.format = AUDIO_FORMAT_FLOAT_PLANAR;
