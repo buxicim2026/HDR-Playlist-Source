@@ -48,7 +48,7 @@ enum {
 	VIS_STOP_NEXT,
 };
 
-enum { MIXED_AUTO = 0, MIXED_FORCE_PQ, MIXED_FORCE_SDR };
+enum { MIXED_AUTO = 0, MIXED_FORCE_PQ, MIXED_FORCE_SDR, MIXED_FORCE_HLG };
 
 struct hdr_playlist {
 	obs_source_t *source;
@@ -85,6 +85,7 @@ static void hdrp_start_current(struct hdr_playlist *p);
 static void hdrp_stop_playback(struct hdr_playlist *p, bool emit_stopped);
 static void hdrp_try_preload_next(struct hdr_playlist *p);
 static void hdrp_on_clip_boundary(struct hdr_playlist *p);
+static void hdrp_playlist_changed(struct hdr_playlist *p);
 static void hdrp_update(void *data, obs_data_t *settings);
 
 /* ------------------------------------------------------------------ */
@@ -116,6 +117,13 @@ static size_t cursor_to_path(struct hdr_playlist *p, const char *path)
 static void load_files_from_settings(struct hdr_playlist *p,
 				     obs_data_t *settings)
 {
+	/* Remember the cursor so a mid-playback edit neither loses our place
+	 * nor leaves us pointing at a clip that no longer exists. */
+	char *keep = NULL;
+	const char *cur = hdrp_playlist_current(p->pl);
+	if (cur)
+		keep = bstrdup(cur);
+
 	hdrp_playlist_clear(p->pl);
 
 	obs_data_array_t *arr = obs_data_get_array(settings, KEY_FILES);
@@ -133,8 +141,18 @@ static void load_files_from_settings(struct hdr_playlist *p,
 		obs_data_array_release(arr);
 	}
 
+	if (keep) {
+		/* The clip we were on survived the edit -> keep the cursor
+		 * there; otherwise fall back to the first entry. */
+		if (cursor_to_path(p, keep) == SIZE_MAX &&
+		    hdrp_playlist_count(p->pl) > 0)
+			hdrp_playlist_set_current(p->pl, 0);
+		bfree(keep);
+	}
+
 	long long saved = obs_data_get_int(settings, KEY_SAVED_INDEX);
-	if (saved >= 0)
+	if (saved >= 0 && (size_t)saved < hdrp_playlist_count(p->pl) &&
+	    !hdrp_playlist_has_current(p->pl))
 		hdrp_playlist_set_current(p->pl, (size_t)saved);
 }
 
@@ -443,6 +461,7 @@ static void hdrp_destroy(void *data)
 static void hdrp_update(void *data, obs_data_t *settings)
 {
 	struct hdr_playlist *p = data;
+	bool list_changed = false;
 	if (!p)
 		return;
 
@@ -462,14 +481,44 @@ static void hdrp_update(void *data, obs_data_t *settings)
 	p->visibility = (int)obs_data_get_int(settings, KEY_VISIBILITY);
 	p->mixed = (int)obs_data_get_int(settings, KEY_MIXED);
 
-	if (files_list_changed(p, settings))
+	if (files_list_changed(p, settings)) {
 		load_files_from_settings(p, settings);
+		list_changed = true;
+	}
 	hdrp_mutex_unlock(&p->mutex);
 
 	hdrp_switcher_set_transition_ms(
 		p->sw, (p->use_transition && !p->low_memory)
 			       ? p->transition_ms
 			       : 0);
+
+	/* Editing the list while a clip is running has to take effect right
+	 * away — that is what "确认" means to a user who is watching the
+	 * preview. */
+	if (list_changed)
+		hdrp_playlist_changed(p);
+}
+
+/* The playlist was edited (possibly mid-playback). */
+static void hdrp_playlist_changed(struct hdr_playlist *p)
+{
+	const char *playing = hdrp_switcher_active_path(p->sw);
+
+	if (!p->stopped && playing && cursor_to_path(p, playing) != SIZE_MAX) {
+		/* The running clip is still part of the new list: let it
+		 * finish, but re-arm the preload so "next" follows the new
+		 * order instead of a stale parked clip. */
+		hdrp_switcher_drop_preload(p->sw);
+		p->need_preload_retry = true;
+		return;
+	}
+
+	if (p->stopped && !p->showing)
+		return; /* nothing on screen; the next play uses the new list */
+
+	/* Current clip vanished (or we were idle on screen): switch to the
+	 * list's current entry now. */
+	hdrp_start_current(p);
 }
 
 static void hdrp_save(void *data, obs_data_t *settings)
@@ -492,6 +541,7 @@ static void hdrp_show(void *data)
 	struct hdr_playlist *p = data;
 	if (!p)
 		return;
+	p->showing = true;
 
 	if (p->stopped && hdrp_playlist_count(p->pl) > 0) {
 		/* The source just became visible and nothing is playing yet.
@@ -534,6 +584,7 @@ static void hdrp_hide(void *data)
 	struct hdr_playlist *p = data;
 	if (!p)
 		return;
+	p->showing = false;
 
 	if (p->visibility == VIS_ALWAYS_PLAY)
 		return;
@@ -604,11 +655,24 @@ hdrp_video_get_color_space(void *data, size_t count,
 	if (!p || !preferred_spaces || count == 0)
 		return GS_CS_SRGB;
 
-	/* Delegate to the presented child (an HDR P010/PQ child reports its
-	 * real GS_CS_2100_*; an SDR child reports sRGB). Never force sRGB on
-	 * an HDR child — that is exactly what crushes HDR in other playlist
-	 * plugins. */
-	return hdrp_switcher_get_color_space(p->sw, count, preferred_spaces);
+	/* Report what the media actually *is*, not what the canvas would like
+	 * it to be. Forwarding obs_source_get_color_space() would let libobs'
+	 * async fallback label an SDR clip as GS_CS_2100_PQ on an HDR canvas
+	 * (it returns the last preferred space when nothing matches), which
+	 * makes OBS skip the SDR -> HDR conversion and shifts the colors.
+	 *
+	 * Policy:
+	 *   auto     -> SDR stays SDR, HDR stays HDR (no forced conversion)
+	 *   force PQ -> always advertise Rec.2100 PQ
+	 *   force SDR-> always advertise sRGB (let OBS tonemap/expand) */
+	if (p->mixed == MIXED_FORCE_SDR)
+		return GS_CS_SRGB;
+	if (p->mixed == MIXED_FORCE_PQ)
+		return GS_CS_2100_PQ;
+	if (p->mixed == MIXED_FORCE_HLG)
+		return GS_CS_2100_HLG;
+
+	return hdrp_switcher_content_space(p->sw, count, preferred_spaces);
 }
 
 static void hdrp_defaults(obs_data_t *settings)
@@ -616,7 +680,7 @@ static void hdrp_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, KEY_MODE, HDRP_MODE_SEQUENTIAL);
 	obs_data_set_default_bool(settings, KEY_HW_DECODE, true);
 	obs_data_set_default_int(settings, KEY_SPEED, 100);
-	obs_data_set_default_bool(settings, KEY_USE_TRANSITION, false);
+	obs_data_set_default_bool(settings, KEY_USE_TRANSITION, true);
 	obs_data_set_default_int(settings, KEY_TRANSITION_MS, 200);
 	obs_data_set_default_bool(settings, KEY_LOW_MEMORY, false);
 	obs_data_set_default_int(settings, KEY_VISIBILITY, VIS_STOP_RESTART);
@@ -709,6 +773,8 @@ static obs_properties_t *hdrp_properties(void *data)
 				  MIXED_FORCE_PQ);
 	obs_property_list_add_int(mixed, obs_module_text("MixedForceSDR"),
 				  MIXED_FORCE_SDR);
+	obs_property_list_add_int(mixed, obs_module_text("MixedForceHLG"),
+				  MIXED_FORCE_HLG);
 
 	/* Folder import placeholder (roadmap: Qt directory picker). */
 	obs_property_t *folder =

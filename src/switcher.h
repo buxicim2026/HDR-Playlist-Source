@@ -80,6 +80,12 @@ void hdrp_switcher_render(struct hdrp_switcher *sw);
 enum gs_color_space
 hdrp_switcher_get_color_space(struct hdrp_switcher *sw, size_t count,
 			      const enum gs_color_space *preferred);
+enum gs_color_space
+hdrp_switcher_content_space(struct hdrp_switcher *sw, size_t count,
+			    const enum gs_color_space *preferred);
+bool hdrp_switcher_content_is_hdr(struct hdrp_switcher *sw, size_t count,
+				  const enum gs_color_space *preferred);
+void hdrp_switcher_drop_preload(struct hdrp_switcher *sw);
 
 /* Crossfade control (0 disables => hard cut on first available frame). */
 void hdrp_switcher_set_transition_ms(struct hdrp_switcher *sw, int ms);

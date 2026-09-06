@@ -19,7 +19,7 @@
 
 #include <string.h>
 
-#include <obs.h>
+#include <obs-module.h>
 #include <media-io/audio-io.h>
 #include <util/bmem.h>
 #include <util/platform.h>
@@ -44,6 +44,9 @@ struct hdrp_audio {
 
 	int64_t offset;     /* child_ts -> parent_ts rebase (ns) */
 	int64_t fade_until; /* wall clock ns; gain ramps until here */
+
+	/* One-shot diagnostics so the OBS log can prove audio is flowing. */
+	bool log_first;
 
 	/* Ring of frames awaiting consumption by the audio output thread.
 	 * ring_head == index of the *next* slot we will write into. When the
@@ -82,10 +85,35 @@ static void on_audio_capture(void *param, obs_source_t *source,
 	if (!au || !audio || audio->frames == 0 || muted)
 		return;
 
-	const enum speaker_layout layout = obs_source_get_speaker_layout(source);
-	const size_t channels = get_audio_channels(layout);
-	if (channels == 0 || channels > HDRP_PLANES_MAX)
+	/* The capture callback hands us PCM that libobs already resampled to
+	 * the OBS mixer rate — report that same rate back to the parent or
+	 * libobs will try to (re)create a resampler from 0 Hz and silently
+	 * drop the audio. */
+	audio_t *aout = obs_get_audio();
+	uint32_t mix_rate = aout ? audio_output_get_sample_rate(aout) : 48000;
+	uint32_t mix_channels = aout ? audio_output_get_channels(aout) : 2;
+	if (!mix_rate)
+		mix_rate = 48000;
+	if (!mix_channels)
+		mix_channels = 2;
+
+	enum speaker_layout layout = obs_source_get_speaker_layout(source);
+	size_t channels = get_audio_channels(layout);
+	if (channels == 0) {
+		/* Child has not reported a layout yet (first frame): fall back
+		 * to the mixer layout instead of dropping the audio. */
+		channels = mix_channels;
+		layout = channels >= 2 ? SPEAKERS_STEREO : SPEAKERS_MONO;
+	}
+	if (channels > HDRP_PLANES_MAX)
 		return;
+
+	if (!au->log_first) {
+		au->log_first = true;
+		blog(LOG_INFO,
+		     "[HDR-PL] audio forwarding active: %d channels @ %d Hz",
+		     (int)channels, (int)mix_rate);
+	}
 
 	const size_t bytes = audio->frames * sizeof(float);
 
@@ -135,6 +163,7 @@ static void on_audio_capture(void *param, obs_source_t *source,
 	out.frames = (uint32_t)audio->frames;
 	out.speakers = layout;
 	out.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	out.samples_per_sec = mix_rate;
 	out.timestamp = (uint64_t)ts;
 	obs_source_output_audio(au->parent, &out);
 
@@ -178,6 +207,8 @@ void hdrp_audio_attach(struct hdrp_audio *au, obs_source_t *child)
 		return;
 	hdrp_audio_detach_current(au);
 	au->active = child;
+	blog(LOG_INFO, "[HDR-PL] audio capture attached to '%s'",
+	     obs_source_get_name(child));
 	obs_source_add_audio_capture_callback(child, on_audio_capture, au);
 
 	/* The OBS audio thread is responsible for keeping the ring drained;

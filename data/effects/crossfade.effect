@@ -48,6 +48,16 @@ float4 PSCrossfade(FragData f_in) : TARGET {
 	return rgba;
 }
 
+/* Linear variant used on HDR canvases: the intermediate is a 16F texture in
+ * 709-extended space, so the sampled values are already in a linear-ish
+ * encoding and must NOT be gamma-decoded again. OBS's own fade transition
+ * does exactly this (technique "FadeLinear" + gs_effect_set_texture_srgb). */
+float4 PSCrossfadeLinear(FragData f_in) : TARGET {
+	float4 a_val = tex_a.Sample(textureSampler, f_in.uv);
+	float4 b_val = tex_b.Sample(textureSampler, f_in.uv);
+	return lerp(a_val, b_val, fade_val);
+}
+
 float4 CrossfadeSingle(FragData f_in) {
 	float4 a_val = tex_a.Sample(textureSampler, f_in.uv);
 	float4 rgba = a_val * fade_val;
@@ -62,6 +72,13 @@ technique Fade {
 	pass {
 		vertex_shader = VSDefault(v_in);
 		pixel_shader = PSCrossfade(f_in);
+	}
+}
+
+technique FadeLinear {
+	pass {
+		vertex_shader = VSDefault(v_in);
+		pixel_shader = PSCrossfadeLinear(f_in);
 	}
 }
 

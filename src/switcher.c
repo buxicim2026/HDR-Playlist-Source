@@ -20,6 +20,7 @@
 #include <obs.h>
 #include <obs-module.h>
 #include <graphics/graphics.h>
+#include <graphics/vec4.h>
 #include <util/bmem.h>
 
 #include "switcher.h"
@@ -97,7 +98,10 @@ struct xfade {
 	gs_eparam_t *tex_a;
 	gs_eparam_t *tex_b;
 	gs_eparam_t *fade;
+	bool linear_tech; /* "FadeLinear" available (HDR path) */
 };
+
+static void xfade_free(struct xfade *x);
 
 static bool xfade_load(struct xfade *x)
 {
@@ -114,7 +118,15 @@ static bool xfade_load(struct xfade *x)
 	x->tex_a = gs_effect_get_param_by_name(x->effect, "tex_a");
 	x->tex_b = gs_effect_get_param_by_name(x->effect, "tex_b");
 	x->fade = gs_effect_get_param_by_name(x->effect, "fade_val");
-	return x->tex_a && x->tex_b && x->fade;
+	if (!x->tex_a || !x->tex_b || !x->fade) {
+		xfade_free(x);
+		return false;
+	}
+	obs_enter_graphics();
+	x->linear_tech =
+		!!gs_effect_get_technique(x->effect, "FadeLinear");
+	obs_leave_graphics();
+	return true;
 }
 
 static void xfade_free(struct xfade *x)
@@ -162,6 +174,7 @@ struct hdrp_switcher {
 	int xf_tex_valid;
 	int xf_tex_w;           /* texrender size currently allocated */
 	int xf_tex_h;
+	enum gs_color_format xf_tex_fmt;
 	gs_texrender_t *xf_tex[2]; /* [0]=outgoing(old) [1]=incoming(new) */
 };
 
@@ -253,31 +266,90 @@ void hdrp_switcher_destroy(struct hdrp_switcher *sw)
 /* crossfade rendering                                                 */
 /* ------------------------------------------------------------------ */
 
-static void xf_texrender_ensure(struct hdrp_switcher *sw, int w, int h)
+/* Hard cap on the fade intermediate. Two 4K RGBA16F buffers cost ~265 MB of
+ * VRAM, which is more than enough to take OBS (or the driver) down, so the
+ * fade is rendered at a reduced resolution and simply stretched back when
+ * drawn — invisible for a 150–400 ms transition, dramatic for stability. */
+#define HDRP_XF_MAX_W 1920
+#define HDRP_XF_MAX_H 1080
+
+/* Frees the intermediates. Only ever called from the graphics thread. */
+static void xf_texrender_release(struct hdrp_switcher *sw)
 {
-	if (w == sw->xf_tex_w && h == sw->xf_tex_h && sw->xf_tex[0] &&
-	    sw->xf_tex[1])
-		return;
 	for (int i = 0; i < 2; i++) {
 		if (sw->xf_tex[i]) {
 			gs_texrender_destroy(sw->xf_tex[i]);
 			sw->xf_tex[i] = NULL;
 		}
-		sw->xf_tex[i] = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
 	}
+	sw->xf_tex_w = 0;
+	sw->xf_tex_h = 0;
+	sw->xf_tex_fmt = GS_RGBA;
+	sw->xf_tex_valid = 0;
+}
+
+/* Intermediate space/format for the fade: on an HDR canvas we need a 16F
+ * buffer in 709-extended space, otherwise PQ highlights get clamped. On a
+ * plain sRGB canvas OBS's own 8-bit path is used (exactly what the built-in
+ * fade transition does). */
+static enum gs_color_space xf_space(void)
+{
+	return gs_get_color_space() == GS_CS_SRGB ? GS_CS_SRGB
+						  : GS_CS_709_EXTENDED;
+}
+
+static void xf_texrender_ensure(struct hdrp_switcher *sw, int w, int h,
+				enum gs_color_format fmt)
+{
+	if (w == sw->xf_tex_w && h == sw->xf_tex_h &&
+	    fmt == sw->xf_tex_fmt && sw->xf_tex[0] && sw->xf_tex[1])
+		return;
+	xf_texrender_release(sw);
+	for (int i = 0; i < 2; i++)
+		sw->xf_tex[i] = gs_texrender_create(fmt, GS_ZS_NONE);
 	sw->xf_tex_w = w;
 	sw->xf_tex_h = h;
+	sw->xf_tex_fmt = fmt;
+}
+
+static void xf_size(int w, int h, int *out_w, int *out_h)
+{
+	double scale = 1.0;
+	if (w > HDRP_XF_MAX_W)
+		scale = (double)HDRP_XF_MAX_W / (double)w;
+	if (h > HDRP_XF_MAX_H) {
+		double s = (double)HDRP_XF_MAX_H / (double)h;
+		if (s < scale)
+			scale = s;
+	}
+	*out_w = (int)((double)w * scale + 0.5);
+	*out_h = (int)((double)h * scale + 0.5);
+	if (*out_w < 1)
+		*out_w = 1;
+	if (*out_h < 1)
+		*out_h = 1;
 }
 
 static void render_child_to_tex(struct hdrp_switcher *sw, obs_source_t *child,
-				int w, int h, int slot_tex)
+				int w, int h, int slot_tex,
+				enum gs_color_space space)
 {
+	struct vec4 clear;
+
 	if (!child || slot_tex < 0 || slot_tex > 1)
 		return;
 	if (!sw->xf_tex[slot_tex])
 		return;
-	gs_texrender_begin(sw->xf_tex[slot_tex], w, h);
+	gs_texrender_reset(sw->xf_tex[slot_tex]);
+	if (!gs_texrender_begin_with_color_space(sw->xf_tex[slot_tex], w, h,
+						 space))
+		return;
+	vec4_zero(&clear);
+	gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+	gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
+	gs_enable_blending(false);
 	obs_source_video_render(child);
+	gs_enable_blending(true);
 	gs_texrender_end(sw->xf_tex[slot_tex]);
 	sw->xf_tex_valid |= (1 << slot_tex);
 }
@@ -287,8 +359,16 @@ static void render_child_to_tex(struct hdrp_switcher *sw, obs_source_t *child,
 static bool draw_xfade(struct hdrp_switcher *sw, obs_source_t *outgoing,
 		       obs_source_t *incoming, float t, int w, int h)
 {
-	render_child_to_tex(sw, outgoing, w, h, 0);
-	render_child_to_tex(sw, incoming, w, h, 1);
+	const enum gs_color_space space = xf_space();
+	const bool hdr = space != GS_CS_SRGB;
+	const enum gs_color_format fmt = hdr ? GS_RGBA16F : GS_RGBA;
+
+	int tw, th;
+	xf_size(w, h, &tw, &th);
+	xf_texrender_ensure(sw, tw, th, fmt);
+
+	render_child_to_tex(sw, outgoing, tw, th, 0, space);
+	render_child_to_tex(sw, incoming, tw, th, 1, space);
 
 	if ((sw->xf_tex_valid & 3) != 3)
 		return false;
@@ -298,28 +378,23 @@ static bool draw_xfade(struct hdrp_switcher *sw, obs_source_t *outgoing,
 	if (!a || !b)
 		return false;
 
-	/* Same technique as OBS's built-in fade transition: sample non-linear
-	 * and linearize on output to an sRGB framebuffer. On an HDR canvas we
-	 * never get here (do_promote refuses the crossfade) so PQ values are
-	 * never clamped by the 8-bit intermediate. */
+	/* Mirrors obs-transitions' fade: non-linear lerp + linearize for sRGB,
+	 * plain linear lerp (sRGB-aware sampling) for HDR. */
 	const bool previous = gs_framebuffer_srgb_enabled();
 	gs_enable_framebuffer_srgb(true);
-	gs_effect_set_texture(sw->xf.tex_a, a);
-	gs_effect_set_texture(sw->xf.tex_b, b);
+	if (hdr) {
+		gs_effect_set_texture_srgb(sw->xf.tex_a, a);
+		gs_effect_set_texture_srgb(sw->xf.tex_b, b);
+	} else {
+		gs_effect_set_texture(sw->xf.tex_a, a);
+		gs_effect_set_texture(sw->xf.tex_b, b);
+	}
 	gs_effect_set_float(sw->xf.fade, t);
-	while (gs_effect_loop(sw->xf.effect, "Fade"))
+	const char *tech = (hdr && sw->xf.linear_tech) ? "FadeLinear" : "Fade";
+	while (gs_effect_loop(sw->xf.effect, tech))
 		gs_draw_sprite(NULL, 0, w, h);
 	gs_enable_framebuffer_srgb(previous);
 	return true;
-}
-
-/* A crossfade is only safe on a plain sRGB canvas: the intermediate texrender
- * is 8-bit and would clamp PQ/wide-gamut values on an HDR canvas. Be
- * conservative and treat every non-sRGB canvas (PQ/HLG/709-EXTENDED/…) as
- * HDR so we never crush highlights. */
-static bool canvas_is_hdr(void)
-{
-	return gs_get_color_space() != GS_CS_SRGB;
 }
 
 /* ------------------------------------------------------------------ */
@@ -531,6 +606,17 @@ void hdrp_switcher_idle_stop_if_playing(struct hdrp_switcher *sw)
 		obs_source_media_stop(idle);
 }
 
+/* Drop whatever is parked on the idle slot (used when the playlist changes
+ * underneath us: the parked clip may no longer be the right "next"). */
+void hdrp_switcher_drop_preload(struct hdrp_switcher *sw)
+{
+	if (!sw)
+		return;
+	if (sw->preload_idx >= 0 && sw->slot[sw->preload_idx])
+		obs_source_media_stop(sw->slot[sw->preload_idx]);
+	clear_preload_state(sw);
+}
+
 /* Force a switch now (manual next/previous, or any seek to a specific file).
  * If a matching preload is ready it is used (no gap); otherwise this stops the
  * current clip and starts `path` on the active slot. */
@@ -569,10 +655,10 @@ static void do_promote(struct hdrp_switcher *sw)
 		sw->active_idx >= 0 ? sw->slot[sw->active_idx] : NULL;
 	int old_idx = sw->active_idx;
 
-	/* Hand the previous path over for the crossfade snapshot. */
-	if (outgoing && old_idx >= 0 &&
-	    sw->xfade_ms > 0 && sw->xf_supported &&
-	    canvas_is_hdr() == false) {
+	/* Hand the previous path over for the crossfade snapshot. HDR canvases
+	 * are supported: the fade then runs through a 16F 709-extended
+	 * intermediate (see draw_xfade), so PQ highlights are preserved. */
+	if (outgoing && old_idx >= 0 && sw->xfade_ms > 0 && sw->xf_supported) {
 		sw->xfade_active = true;
 		sw->xfade_elapsed = 0.0;
 		sw->xf_tex_valid = 0;
@@ -688,6 +774,12 @@ void hdrp_switcher_render(struct hdrp_switcher *sw)
 	if (!sw)
 		return;
 
+	/* Give the fade intermediates back as soon as they are not needed
+	 * anymore — keeping two 1080p/16F buffers alive between switches was
+	 * a significant chunk of our VRAM footprint. */
+	if (!sw->xfade_active)
+		xf_texrender_release(sw);
+
 	obs_source_t *active =
 		sw->active_idx >= 0 ? sw->slot[sw->active_idx] : NULL;
 	obs_source_t *outgoing = NULL;
@@ -712,8 +804,6 @@ void hdrp_switcher_render(struct hdrp_switcher *sw)
 			obs_source_video_render(active);
 		return;
 	}
-
-	xf_texrender_ensure(sw, (int)w, (int)h);
 
 	float t = 0.0f;
 	if (sw->xfade_ms > 0)
@@ -743,4 +833,48 @@ hdrp_switcher_get_color_space(struct hdrp_switcher *sw, size_t count,
 	if (count > 0 && preferred)
 		return preferred[0];
 	return GS_CS_SRGB;
+}
+
+/* The *real* color space of the media currently playing.
+ *
+ * We cannot simply forward obs_source_get_color_space(): for async sources
+ * libobs returns the last entry of `preferred_spaces` when none of them
+ * matches, so on an HDR canvas an SDR clip would be reported as
+ * GS_CS_2100_PQ and OBS would skip its SDR -> HDR conversion.
+ *
+ * Instead we probe: asking for [C, X] returns C if and only if the child's
+ * real space is C (libobs only breaks early on an exact match). */
+enum gs_color_space
+hdrp_switcher_content_space(struct hdrp_switcher *sw, size_t count,
+			    const enum gs_color_space *preferred)
+{
+	obs_source_t *child = NULL;
+	if (sw && sw->active_idx >= 0)
+		child = sw->slot[sw->active_idx];
+	if (!child)
+		return (count > 0 && preferred) ? preferred[0] : GS_CS_SRGB;
+
+	static const enum gs_color_space cands[] = {
+		GS_CS_SRGB,        GS_CS_SRGB_16F,  GS_CS_709_EXTENDED,
+		GS_CS_709_SCRGB,   GS_CS_2100_PQ,   GS_CS_2100_HLG,
+	};
+	const size_t n = sizeof(cands) / sizeof(cands[0]);
+
+	for (size_t i = 0; i < n; i++) {
+		const enum gs_color_space c = cands[i];
+		const enum gs_color_space other =
+			(c == GS_CS_SRGB) ? GS_CS_2100_PQ : GS_CS_SRGB;
+		const enum gs_color_space pref[2] = {c, other};
+		if (obs_source_get_color_space(child, 2, pref) == c)
+			return c;
+	}
+	return GS_CS_SRGB;
+}
+
+bool hdrp_switcher_content_is_hdr(struct hdrp_switcher *sw, size_t count,
+				  const enum gs_color_space *preferred)
+{
+	const enum gs_color_space cs =
+		hdrp_switcher_content_space(sw, count, preferred);
+	return cs != GS_CS_SRGB && cs != GS_CS_SRGB_16F;
 }
