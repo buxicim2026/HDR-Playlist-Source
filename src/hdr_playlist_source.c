@@ -11,6 +11,7 @@
  * pulled from a small ring buffer by the `audio_render` callback.
  */
 
+#include <stdio.h>
 #include <string.h>
 
 #include <obs-module.h>
@@ -40,6 +41,7 @@
 #define KEY_SAVED_INDEX    "saved_index"
 #define KEY_ADAPT_CANVAS   "adapt_canvas"
 #define KEY_DEINTERLACE    "deinterlace"
+#define KEY_ADD_FOLDER     "hdrp_add_folder"
 
 enum {
 	VIS_STOP_RESTART = 0,
@@ -89,8 +91,9 @@ struct hdr_playlist {
 	bool showing;
 	bool stopped;
 	bool need_preload_retry;
-	float hb_seconds;   /* diagnostics heartbeat */
+	float hb_seconds;    /* diagnostics heartbeat */
 	int64_t hb_last_pos; /* position at the previous heartbeat (ms) */
+	float props_seconds; /* throttles the properties refresh */
 };
 
 /* ------------------------------------------------------------------ */
@@ -109,6 +112,79 @@ static void hdrp_apply_opts(const struct hdr_playlist *p,
 	opts->hw_decode = p->hw_decode;
 	opts->speed_percent = p->speed_percent;
 	opts->clear_on_end = false;
+}
+
+/* ------------------------------------------------------------------ */
+/* properties panel status                                             */
+/* ------------------------------------------------------------------ */
+
+static void hdrp_build_now_playing(struct hdr_playlist *p, char *buf,
+				   size_t size)
+{
+	const char *path;
+	char *name;
+	int64_t dur, pos;
+	size_t idx;
+
+	if (!p || p->stopped || !(path = hdrp_switcher_active_path(p->sw))) {
+		snprintf(buf, size, "%s", obs_module_text("StatusIdle"));
+		return;
+	}
+
+	name = hdrp_basename_dup(path);
+	dur = hdrp_switcher_get_duration(p->sw);
+	pos = hdrp_switcher_get_time(p->sw);
+	idx = hdrp_playlist_has_current(p->pl)
+		      ? hdrp_playlist_current_index(p->pl) + 1
+		      : 0;
+
+	if (dur > 0) {
+		int pct = (int)((pos * 100) / dur);
+		snprintf(buf, size, "%s  [%zu/%zu]  %llds / %llds  (%d%%)",
+			 name, idx, hdrp_playlist_count(p->pl),
+			 (long long)(pos / 1000), (long long)(dur / 1000), pct);
+	} else {
+		snprintf(buf, size, "%s  [%zu/%zu]  %llds  (%s)", name, idx,
+			 hdrp_playlist_count(p->pl), (long long)(pos / 1000),
+			 obs_module_text("StatusLive"));
+	}
+	bfree(name);
+}
+
+static void hdrp_build_session_info(struct hdr_playlist *p, char *buf,
+				    size_t size)
+{
+	if (!p) {
+		snprintf(buf, size, "-");
+		return;
+	}
+	snprintf(buf, size, "%ux%u · %s · %s", p->canvas_w, p->canvas_h,
+		 p->output_hdr ? "HDR" : "SDR",
+		 p->low_memory ? "low-mem" : "gapless");
+}
+
+/* Queued onto the UI thread so we never emit the properties signal from the
+ * graphics thread (and the weak ref keeps this safe if the source dies). */
+static void hdrp_ui_refresh_task(void *param)
+{
+	obs_weak_source_t *weak = param;
+	obs_source_t *src = obs_weak_source_get_source(weak);
+	if (src) {
+		obs_source_update_properties(src);
+		obs_source_release(src);
+	}
+	obs_weak_source_release(weak);
+}
+
+static void hdrp_queue_props_refresh(struct hdr_playlist *p)
+{
+	obs_weak_source_t *w;
+
+	if (!p || !p->source)
+		return;
+	w = obs_source_get_weak_source(p->source);
+	if (w)
+		obs_queue_task(OBS_TASK_UI, hdrp_ui_refresh_task, w, false);
 }
 
 /* Is OBS configured to *output* HDR? (Advanced -> Color Format P010/I010/...
@@ -191,6 +267,9 @@ static void load_files_from_settings(struct hdr_playlist *p,
 	hdrp_playlist_clear(p->pl);
 
 	obs_data_array_t *arr = obs_data_get_array(settings, KEY_FILES);
+	obs_data_array_t *out = obs_data_array_create();
+	bool expanded = false;
+
 	if (arr) {
 		size_t n = obs_data_array_count(arr);
 		for (size_t i = 0; i < n; i++) {
@@ -199,12 +278,50 @@ static void load_files_from_settings(struct hdr_playlist *p,
 			if (!item)
 				continue;
 			path = obs_data_get_string(item, "value");
-			if (path && *path)
-				hdrp_playlist_add_file(p->pl, path);
+			if (path && *path) {
+				obs_data_t *it;
+				if (hdrp_playlist_path_is_dir(path)) {
+					/* A folder was dropped (or typed) into
+					 * the list: expand it into its media
+					 * files so the entry is playable. */
+					size_t before =
+						hdrp_playlist_count(p->pl);
+					size_t after;
+					hdrp_playlist_add_folder(p->pl, path, 4);
+					after = hdrp_playlist_count(p->pl);
+					for (size_t k = before; k < after; k++) {
+						it = obs_data_create();
+						obs_data_set_string(
+							it, "value",
+							hdrp_playlist_at(
+								p->pl, k));
+						obs_data_array_push_back(
+							out, it);
+						obs_data_release(it);
+					}
+					expanded = true;
+					blog(LOG_INFO,
+					     "[HDR-PL] expanded folder '%s' "
+					     "-> %zu file(s)",
+					     path, after - before);
+				} else {
+					hdrp_playlist_add_file(p->pl, path);
+					it = obs_data_create();
+					obs_data_set_string(it, "value", path);
+					obs_data_array_push_back(out, it);
+					obs_data_release(it);
+				}
+			}
 			obs_data_release(item);
 		}
 		obs_data_array_release(arr);
 	}
+
+	/* Write the expanded list back so the properties dialog shows the
+	 * individual files instead of the folder entry. */
+	if (expanded)
+		obs_data_set_array(settings, KEY_FILES, out);
+	obs_data_array_release(out);
 
 	if (keep) {
 		if (cursor_to_path(p, keep) == SIZE_MAX &&
@@ -288,6 +405,7 @@ static void hdrp_start_current(struct hdr_playlist *p)
 
 	obs_source_media_started(p->source);
 	p->need_preload_retry = true;
+	hdrp_queue_props_refresh(p);
 }
 
 static void hdrp_stop_playback(struct hdr_playlist *p)
@@ -298,6 +416,7 @@ static void hdrp_stop_playback(struct hdr_playlist *p)
 	}
 	hdrp_switcher_stop(p->sw);
 	p->stopped = true;
+	hdrp_queue_props_refresh(p);
 }
 
 static void hdrp_finish_at_end(struct hdr_playlist *p)
@@ -359,6 +478,7 @@ static void hdrp_switcher_ended(void *opaque)
 	hdrp_attach_audio_to_active(p);
 	obs_source_media_started(p->source);
 	p->need_preload_retry = true;
+	hdrp_queue_props_refresh(p);
 }
 
 static void hdrp_jump(struct hdr_playlist *p, bool forward)
@@ -389,6 +509,7 @@ static void hdrp_jump(struct hdr_playlist *p, bool forward)
 	hdrp_switcher_play(p->sw, target, &opts);
 	hdrp_attach_audio_to_active(p);
 	p->need_preload_retry = true;
+	hdrp_queue_props_refresh(p);
 }
 
 /* The playlist was edited. Make it take effect immediately. */
@@ -571,6 +692,51 @@ static void hdrp_update(void *data, obs_data_t *settings)
 	p->adapt_canvas = obs_data_get_bool(settings, KEY_ADAPT_CANVAS);
 	p->deinterlace_mode = (int)obs_data_get_int(settings, KEY_DEINTERLACE);
 
+	/* "Add folder…" picker: expand the chosen directory straight into the
+	 * playlist settings, then clear the picker so it can be reused. */
+	{
+		const char *add_dir = obs_data_get_string(settings, KEY_ADD_FOLDER);
+		if (add_dir && *add_dir) {
+			obs_data_array_t *old = obs_data_get_array(settings,
+								   KEY_FILES);
+			obs_data_array_t *merged = obs_data_array_create();
+			struct hdrp_playlist *tmp = hdrp_playlist_create();
+			size_t added;
+
+			if (old) {
+				size_t n = obs_data_array_count(old);
+				for (size_t i = 0; i < n; i++) {
+					obs_data_t *it =
+						obs_data_array_item(old, i);
+					if (it) {
+						obs_data_array_push_back(
+							merged, it);
+						obs_data_release(it);
+					}
+				}
+				obs_data_array_release(old);
+			}
+
+			hdrp_playlist_add_folder(tmp, add_dir, 4);
+			added = hdrp_playlist_count(tmp);
+			for (size_t i = 0; i < added; i++) {
+				obs_data_t *it = obs_data_create();
+				obs_data_set_string(it, "value",
+						    hdrp_playlist_at(tmp, i));
+				obs_data_array_push_back(merged, it);
+				obs_data_release(it);
+			}
+			hdrp_playlist_destroy(tmp);
+
+			obs_data_set_array(settings, KEY_FILES, merged);
+			obs_data_array_release(merged);
+			obs_data_set_string(settings, KEY_ADD_FOLDER, "");
+			blog(LOG_INFO,
+			     "[HDR-PL] added %zu file(s) from folder '%s'",
+			     added, add_dir);
+		}
+	}
+
 	if (files_list_changed(p, settings)) {
 		load_files_from_settings(p, settings);
 		list_changed = true;
@@ -703,6 +869,18 @@ static void hdrp_video_tick(void *data, float seconds)
 	} else {
 		p->hb_seconds = 0.0f;
 		p->hb_last_pos = 0;
+	}
+
+	/* Keep the properties panel's progress readout ticking (1 Hz, and
+	 * only while playing — the refresh is queued onto the UI thread). */
+	if (!p->stopped) {
+		p->props_seconds += seconds;
+		if (p->props_seconds >= 1.0f) {
+			p->props_seconds = 0.0f;
+			hdrp_queue_props_refresh(p);
+		}
+	} else {
+		p->props_seconds = 0.0f;
 	}
 }
 
@@ -908,12 +1086,23 @@ static obs_properties_t *hdrp_properties(void *data)
 	obs_property_t *adapt;
 	obs_property_t *deint;
 
-	UNUSED_PARAMETER(data);
 	obs_properties_set_flags(props, OBS_PROPERTIES_DEFER_UPDATE);
 
 	static const char *media_filter =
-		"Media files (*.mp4 *.m4v *.ts *.mov *.mxf *.flv *.mkv *.avi "
-		"*.webm *.gif *.mp3 *.aac *.ogg *.wav *.flac *.m4a *.opus)";
+		"Media files (*.mp4 *.m4v *.ts *.m2ts *.mov *.mxf *.flv *.mkv "
+		"*.avi *.webm *.gif *.m3u8 *.mpd *.mp3 *.aac *.ogg *.wav "
+		"*.flac *.m4a *.opus)";
+
+	/* Live status: current file + progress, and the detected session. */
+	{
+		char status[256];
+		hdrp_build_now_playing(data, status, sizeof(status));
+		obs_properties_add_text(props, "hdrp_status_now", status,
+					OBS_TEXT_INFO);
+		hdrp_build_session_info(data, status, sizeof(status));
+		obs_properties_add_text(props, "hdrp_status_session", status,
+					OBS_TEXT_INFO);
+	}
 
 	list = obs_properties_add_editable_list(
 		props, KEY_FILES, obs_module_text("PlaylistFiles"),
@@ -951,6 +1140,10 @@ static obs_properties_t *hdrp_properties(void *data)
 	obs_properties_add_bool(props, KEY_LOW_MEMORY,
 				obs_module_text("LowMemory"));
 
+	obs_properties_add_path(props, KEY_ADD_FOLDER,
+				obs_module_text("AddFolderPick"),
+				OBS_PATH_DIRECTORY, NULL, NULL);
+
 	adapt = obs_properties_add_bool(props, KEY_ADAPT_CANVAS,
 					obs_module_text("AdaptToCanvas"));
 	obs_property_set_long_description(
@@ -964,10 +1157,19 @@ static obs_properties_t *hdrp_properties(void *data)
 					  obs_module_text("DeinterlaceHint"));
 	obs_property_list_add_int(deint, obs_module_text("DeintOff"),
 				  OBS_DEINTERLACE_MODE_DISABLE);
-	obs_property_list_add_int(deint, obs_module_text("DeintLinear"),
-				  OBS_DEINTERLACE_MODE_LINEAR);
+	/* The *_2X modes emit one frame per field, i.e. 1080i25 -> 50p. */
+	obs_property_list_add_int(deint, obs_module_text("DeintYadif2x"),
+				  OBS_DEINTERLACE_MODE_YADIF_2X);
+	obs_property_list_add_int(deint, obs_module_text("DeintLinear2x"),
+				  OBS_DEINTERLACE_MODE_LINEAR_2X);
+	obs_property_list_add_int(deint, obs_module_text("DeintBlend2x"),
+				  OBS_DEINTERLACE_MODE_BLEND_2X);
 	obs_property_list_add_int(deint, obs_module_text("DeintYadif"),
 				  OBS_DEINTERLACE_MODE_YADIF);
+	obs_property_list_add_int(deint, obs_module_text("DeintLinear"),
+				  OBS_DEINTERLACE_MODE_LINEAR);
+	obs_property_list_add_int(deint, obs_module_text("DeintDiscard"),
+				  OBS_DEINTERLACE_MODE_DISCARD);
 
 	obs_properties_add_list(props, KEY_VISIBILITY,
 				obs_module_text("Visibility"),

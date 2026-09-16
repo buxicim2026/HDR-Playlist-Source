@@ -46,6 +46,9 @@ OBS → 设置 → 高级：
 | 播放速度 | 50–200% |
 | 交叉淡化转场（默认开启） | 片段间交叉淡化。HDR 画布使用 16F 中间缓冲保留高光；缓冲分辨率上限 1080p，转场结束立即释放显存 |
 | 低内存模式（**默认开启**） | 只创建一个解码器、不预载下一片段，内存/显存占用约减半（4K HDR 尤其明显）。关闭后才会创建第二个解码器实现无缝切换 |
+| 自适应画布尺寸（默认开） | 按 OBS 基础画布分辨率输出并等比缩放视频，避免每帧额外的全分辨率缩放/色彩转换 |
+| 去隔行 | 逐行片源选「关闭」；隔行片源选 2x 系列，1080i25 → **50p**（OBS 画布帧率需 ≥ 50，建议 60） |
+| 播放列表 | 支持拖入/填入**文件夹**（自动展开）与**网络地址**（HLS `.m3u8`、`.mpd`、rtmp/rtsp/srt 等） |
 | HDR/SDR 混播策略 | **自动**（默认，推荐）：SDR 文件按 SDR 直出、HDR 文件按 HDR 直出，不做强制转换；也可强制全部按 HDR（Rec.2100 PQ/HLG）或强制全部按 SDR 输出 |
 | 源隐藏时 | 停止并再次可见时重播 / 暂停并续播 / 始终播放 / 停止并播下一个 |
 
@@ -87,6 +90,11 @@ OBS → 设置 → 高级：
 Features:
 
 - Sequential / Loop / Shuffle playlist modes
+- **Folders** dropped/typed into the list are expanded into their media files automatically
+- **Network streams**: HLS (`.m3u8`), MPEG-DASH (`.mpd`), RTMP/RTSP/SRT and plain http(s) URLs
+- **Live status in the properties panel**: current file, playlist position, elapsed/total time, detected canvas/HDR session
+- **Deinterlacing** incl. 2x modes (1080i25 → 50p; canvas fps must be ≥ 50)
+- **Canvas-adaptive output**: reports/renders at the OBS base canvas size and aspect-fits, avoiding a per-frame full-resolution scale/colour pass
 - Gapless A/B preload & switch
 - Crossfade transition, default 200 ms — on an **HDR canvas** it renders through a capped-1080p 16F intermediate (released immediately after the fade) so PQ/HLG highlights are never clamped
 - **SDR passthrough**: an SDR clip reports as SDR and OBS applies its normal SDR→HDR expansion, instead of being mislabelled HDR (the bug that washes out other playlist plugins)

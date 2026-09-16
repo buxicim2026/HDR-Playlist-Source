@@ -21,6 +21,7 @@
 #include <graphics/vec4.h>
 #include <util/bmem.h>
 
+#include "playlist.h"
 #include "switcher.h"
 
 /* ------------------------------------------------------------------ */
@@ -255,9 +256,33 @@ static void slot_update_settings(obs_source_t *child, const char *path,
 				 const struct hdrp_switcher_opts *opts)
 {
 	obs_data_t *s = obs_source_get_settings(child);
+	bool is_url;
+
 	if (!s)
 		return;
-	obs_data_set_string(s, "local_file", path ? path : "");
+
+	is_url = hdrp_playlist_is_url(path);
+
+	if (is_url) {
+		/* Network stream (HLS/M3U8, RTMP, SRT, ...): ffmpeg_source
+		 * switches to URL mode. A larger read buffer and a short
+		 * reconnect delay keep live streams alive. */
+		obs_data_set_bool(s, "is_local_file", false);
+		obs_data_set_string(s, "input", path ? path : "");
+		obs_data_set_string(s, "input_format",
+				    (path && strstr(path, ".m3u8")) ? "m3u8"
+								    : "");
+		obs_data_set_int(s, "buffering_mb", 8);
+		obs_data_set_int(s, "reconnect_delay_sec", 2);
+		obs_data_set_bool(s, "seekable", false);
+		obs_data_set_bool(s, "looping", false);
+	} else {
+		obs_data_set_bool(s, "is_local_file", true);
+		obs_data_set_string(s, "local_file", path ? path : "");
+		obs_data_set_string(s, "input", "");
+		obs_data_set_string(s, "input_format", "");
+	}
+
 	obs_data_set_bool(s, "hw_decode", opts->hw_decode);
 	obs_data_set_int(s, "speed_percent", opts->speed_percent);
 	obs_data_set_int(s, "color_range", VIDEO_RANGE_DEFAULT);

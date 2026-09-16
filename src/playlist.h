@@ -56,3 +56,10 @@ void hdrp_playlist_load(struct hdrp_playlist *pl, obs_data_t *settings);
 
 /* True if `path` is a media file we can play (extension filter). */
 bool hdrp_playlist_is_supported_file(const char *path);
+
+/* True if `path` is a network stream address (http/https/rtmp/rtsp/srt/...).
+ * Such entries are handed to the media source as URLs, not local files. */
+bool hdrp_playlist_is_url(const char *path);
+
+/* True if `path` is an existing directory (folder entries are expanded). */
+bool hdrp_playlist_path_is_dir(const char *path);

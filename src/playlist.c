@@ -51,6 +51,19 @@ static bool str_ends_with_ci(const char *s, const char *suffix)
 	return true;
 }
 
+static bool str_starts_with_ci(const char *s, const char *prefix)
+{
+	size_t pl = strlen(prefix);
+	if (strlen(s) < pl)
+		return false;
+	for (size_t i = 0; i < pl; i++) {
+		if (tolower((unsigned char)s[i]) !=
+		    tolower((unsigned char)prefix[i]))
+			return false;
+	}
+	return true;
+}
+
 static int cmp_cstr(const void *a, const void *b)
 {
 	const char *const *pa = a;
@@ -175,8 +188,8 @@ static size_t expand_dir(struct hdrp_playlist *pl, const char *dir,
 bool hdrp_playlist_is_supported_file(const char *path)
 {
 	static const char *const video[] = {
-		"mp4", "m4v", "ts",   "mov", "mxf",
-		"flv", "mkv", "avi",  "webm", "gif",
+		"mp4", "m4v", "ts",   "mov", "mxf",  "flv", "mkv",
+		"avi", "webm", "gif", "m3u8", "mpd", "m2ts", "mts",
 	};
 	static const char *const audio[] = {
 		"mp3", "aac", "ogg", "wav", "flac", "m4a", "opus",
@@ -188,6 +201,29 @@ bool hdrp_playlist_is_supported_file(const char *path)
 		if (str_ends_with_ci(path, audio[i]))
 			return true;
 	return false;
+}
+
+bool hdrp_playlist_is_url(const char *path)
+{
+	if (!path || !*path)
+		return false;
+	if (strstr(path, "://"))
+		return true;
+	/* Bare-scheme media protocols ("rtmp:host/app", "srt:host:port"). */
+	if (str_starts_with_ci(path, "rtmp:") ||
+	    str_starts_with_ci(path, "rtmps:") ||
+	    str_starts_with_ci(path, "rtsp:") ||
+	    str_starts_with_ci(path, "srt:") ||
+	    str_starts_with_ci(path, "rist:") ||
+	    str_starts_with_ci(path, "udp:") ||
+	    str_starts_with_ci(path, "tcp:"))
+		return true;
+	return false;
+}
+
+bool hdrp_playlist_path_is_dir(const char *path)
+{
+	return path && *path && path_is_dir(path);
 }
 
 struct hdrp_playlist *hdrp_playlist_create(void)
