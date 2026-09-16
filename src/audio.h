@@ -41,3 +41,7 @@ void hdrp_audio_flush(struct hdrp_audio *au);
 bool hdrp_audio_render(struct hdrp_audio *au, uint64_t *ts_out,
 		       struct obs_source_audio_mix *audio_output,
 		       uint32_t mixers, size_t channels, size_t sample_rate);
+
+/* Diagnostics. */
+size_t hdrp_audio_fill(struct hdrp_audio *au);     /* buffered frames */
+uint32_t hdrp_audio_channels(struct hdrp_audio *au);

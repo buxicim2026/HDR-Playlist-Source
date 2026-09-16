@@ -88,9 +88,22 @@ hdrp_switcher_content_space(struct hdrp_switcher *sw, size_t count,
  * frame cache. */
 void hdrp_switcher_set_preload_enabled(struct hdrp_switcher *sw, bool enable);
 
+/* Deinterlacing for the child decoders (enum obs_deinterlace_mode). Leave at
+ * OBS_DEINTERLACE_MODE_DISABLE for progressive media; interlaced sources look
+ * combed without it. Yadif costs GPU time, so it is opt-in. */
+void hdrp_switcher_set_deinterlace(struct hdrp_switcher *sw, int mode);
+int hdrp_switcher_get_deinterlace(const struct hdrp_switcher *sw);
+
 /* Crossfade: 0 disables (hard cut). */
 void hdrp_switcher_set_transition_ms(struct hdrp_switcher *sw, int ms);
 int hdrp_switcher_get_transition_ms(const struct hdrp_switcher *sw);
 
 /* Release the idle decoder (low-memory mode). */
 void hdrp_switcher_idle_stop_if_playing(struct hdrp_switcher *sw);
+
+/* Canvas adaptation: when adaptive is true the source reports (and renders
+ * at) the OBS base canvas size, fitting the video inside it. This keeps the
+ * compositor 1:1 and avoids an extra full-resolution scaling/conversion
+ * pass for every frame. Pass adaptive=false to output the native size. */
+void hdrp_switcher_set_output_size(struct hdrp_switcher *sw, uint32_t w,
+				   uint32_t h, bool adaptive);

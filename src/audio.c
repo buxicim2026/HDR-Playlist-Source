@@ -241,6 +241,28 @@ bool hdrp_audio_render(struct hdrp_audio *au, uint64_t *ts_out,
 	return true;
 }
 
+size_t hdrp_audio_fill(struct hdrp_audio *au)
+{
+	size_t n;
+	if (!au)
+		return 0;
+	hdrp_mutex_lock(&au->mtx);
+	n = au->count;
+	hdrp_mutex_unlock(&au->mtx);
+	return n;
+}
+
+uint32_t hdrp_audio_channels(struct hdrp_audio *au)
+{
+	uint32_t c;
+	if (!au)
+		return 0;
+	hdrp_mutex_lock(&au->mtx);
+	c = au->ready ? au->channels : 0;
+	hdrp_mutex_unlock(&au->mtx);
+	return c;
+}
+
 /* ------------------------------------------------------------------ */
 /* public API                                                          */
 /* ------------------------------------------------------------------ */

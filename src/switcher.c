@@ -99,6 +99,8 @@ struct hdrp_switcher {
 
 	bool preload_pending; /* update issued, waiting to park */
 	bool preload_ready;   /* parked on its first frame, paused */
+	bool park_sent;       /* seek+pause already issued for this preload */
+	int preload_ticks;    /* watchdog against a preload that never parks */
 
 	volatile bool end_requested; /* media_ended fired for the active slot */
 	bool promote_event;
@@ -115,6 +117,13 @@ struct hdrp_switcher {
 	int xf_tex_h;
 	enum gs_color_format xf_tex_fmt;
 	gs_texrender_t *xf_tex[2];
+
+	/* canvas adaptation */
+	bool adaptive;
+	uint32_t out_w;
+	uint32_t out_h;
+
+	int deinterlace_mode; /* enum obs_deinterlace_mode */
 };
 
 /* ------------------------------------------------------------------ */
@@ -171,8 +180,34 @@ static obs_source_t *ensure_slot(struct hdrp_switcher *sw, int idx)
 		blog(LOG_ERROR, "[HDR-PL] failed to create slot %d", idx);
 		return NULL;
 	}
+	obs_source_set_deinterlace_mode(
+		sw->slot[idx], (enum obs_deinterlace_mode)sw->deinterlace_mode);
 	obs_source_add_active_child(sw->parent, sw->slot[idx]);
 	return sw->slot[idx];
+}
+
+void hdrp_switcher_set_deinterlace(struct hdrp_switcher *sw, int mode)
+{
+	if (!sw)
+		return;
+	if (mode < OBS_DEINTERLACE_MODE_DISABLE ||
+	    mode > OBS_DEINTERLACE_MODE_YADIF_2X)
+		mode = OBS_DEINTERLACE_MODE_DISABLE;
+	if (sw->deinterlace_mode == mode)
+		return;
+	sw->deinterlace_mode = mode;
+	for (int i = 0; i < 2; i++) {
+		if (sw->slot[i])
+			obs_source_set_deinterlace_mode(
+				sw->slot[i],
+				(enum obs_deinterlace_mode)mode);
+	}
+	blog(LOG_INFO, "[HDR-PL] deinterlace mode set to %d", mode);
+}
+
+int hdrp_switcher_get_deinterlace(const struct hdrp_switcher *sw)
+{
+	return sw ? sw->deinterlace_mode : OBS_DEINTERLACE_MODE_DISABLE;
 }
 
 static void release_slot(struct hdrp_switcher *sw, int idx)
@@ -315,6 +350,8 @@ static void clear_preload(struct hdrp_switcher *sw)
 {
 	sw->preload_pending = false;
 	sw->preload_ready = false;
+	sw->park_sent = false;
+	sw->preload_ticks = 0;
 	sw->preload_idx = -1;
 	bfree(sw->preload_path);
 	sw->preload_path = NULL;
@@ -461,15 +498,29 @@ obs_source_t *hdrp_switcher_slot(const struct hdrp_switcher *sw, int idx)
 	return sw->slot[idx];
 }
 
+void hdrp_switcher_set_output_size(struct hdrp_switcher *sw, uint32_t w,
+				   uint32_t h, bool adaptive)
+{
+	if (!sw)
+		return;
+	sw->adaptive = adaptive && w && h;
+	sw->out_w = w;
+	sw->out_h = h;
+}
+
 uint32_t hdrp_switcher_get_width(struct hdrp_switcher *sw)
 {
 	obs_source_t *c = hdrp_switcher_active_child(sw);
+	if (sw && sw->adaptive && sw->out_w)
+		return sw->out_w;
 	return c ? obs_source_get_width(c) : 0;
 }
 
 uint32_t hdrp_switcher_get_height(struct hdrp_switcher *sw)
 {
 	obs_source_t *c = hdrp_switcher_active_child(sw);
+	if (sw && sw->adaptive && sw->out_h)
+		return sw->out_h;
 	return c ? obs_source_get_height(c) : 0;
 }
 
@@ -555,6 +606,8 @@ static void promote(struct hdrp_switcher *sw)
 	sw->preload_idx = -1;
 	sw->preload_pending = false;
 	sw->preload_ready = false;
+	sw->park_sent = false;
+	sw->preload_ticks = 0;
 	sw->end_requested = false;
 
 	if (do_xf) {
@@ -596,13 +649,32 @@ void hdrp_switcher_tick(struct hdrp_switcher *sw, float seconds)
 		} else {
 			st = obs_source_media_get_state(child);
 			if (st == OBS_MEDIA_STATE_PLAYING) {
-				park_child(child);
+				/* Issue seek+pause exactly once: doing it every
+				 * frame keeps the decoder in a seek storm and
+				 * drags the whole session down. */
+				if (!sw->park_sent) {
+					sw->park_sent = true;
+					park_child(child);
+				}
 			} else if (st == OBS_MEDIA_STATE_PAUSED) {
 				sw->preload_pending = false;
+				sw->park_sent = false;
+				sw->preload_ticks = 0;
 				sw->preload_ready = true;
 			} else if (st == OBS_MEDIA_STATE_ENDED ||
 				   st == OBS_MEDIA_STATE_STOPPED ||
 				   st == OBS_MEDIA_STATE_ERROR) {
+				clear_preload(sw);
+			}
+
+			/* Watchdog: give up on a preload that never parks
+			 * (~3 s), otherwise it would block preloading for the
+			 * rest of the session. */
+			if (sw->preload_pending &&
+			    ++sw->preload_ticks > 180) {
+				blog(LOG_WARNING,
+				     "[HDR-PL] preload did not park in time; "
+				     "dropping it");
 				clear_preload(sw);
 			}
 		}
@@ -670,9 +742,12 @@ static void xf_size(int w, int h, int *out_w, int *out_h)
 		*out_h = 1;
 }
 
+/* Draws `child` into the intermediate, scaled/positioned by (scale, ox, oy)
+ * which have already been mapped into the intermediate's pixel space. */
 static void render_child_to_tex(struct hdrp_switcher *sw, obs_source_t *child,
 				int w, int h, int slot_tex,
-				enum gs_color_space space)
+				enum gs_color_space space, float scale,
+				float ox, float oy)
 {
 	struct vec4 clear;
 
@@ -686,25 +761,58 @@ static void render_child_to_tex(struct hdrp_switcher *sw, obs_source_t *child,
 	gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
 	gs_ortho(0.0f, (float)w, 0.0f, (float)h, -100.0f, 100.0f);
 	gs_enable_blending(false);
+	gs_matrix_push();
+	gs_matrix_translate3f(ox, oy, 0.0f);
+	gs_matrix_scale3f(scale, scale, 1.0f);
 	obs_source_video_render(child);
+	gs_matrix_pop();
 	gs_enable_blending(true);
 	gs_texrender_end(sw->xf_tex[slot_tex]);
 	sw->xf_tex_valid |= (1 << slot_tex);
 }
 
+/* Aspect-fit the source into the output rectangle. */
+static void fit_into(uint32_t cw, uint32_t ch, uint32_t ow, uint32_t oh,
+		     float *scale, float *ox, float *oy)
+{
+	float ax, ay;
+
+	if (!cw || !ch) {
+		*scale = 1.0f;
+		*ox = 0.0f;
+		*oy = 0.0f;
+		return;
+	}
+	ax = (float)ow / (float)cw;
+	ay = (float)oh / (float)ch;
+	*scale = ax < ay ? ax : ay;
+	*ox = ((float)ow - (float)cw * (*scale)) * 0.5f;
+	*oy = ((float)oh - (float)ch * (*scale)) * 0.5f;
+}
+
+static void render_single(obs_source_t *child, float scale, float ox, float oy)
+{
+	gs_matrix_push();
+	gs_matrix_translate3f(ox, oy, 0.0f);
+	gs_matrix_scale3f(scale, scale, 1.0f);
+	obs_source_video_render(child);
+	gs_matrix_pop();
+}
+
 void hdrp_switcher_render(struct hdrp_switcher *sw)
 {
 	obs_source_t *active;
-	obs_source_t *outgoing = NULL;
-	uint32_t w, h;
+	obs_source_t *outgoing;
+	uint32_t cw, ch, ow, oh;
 	int tw, th;
+	float scale, ox, oy, is, ix, iy;
 	float t;
 	enum gs_color_space space;
 	enum gs_color_format fmt;
 	gs_texture_t *a;
 	gs_texture_t *b;
-	const bool previous = gs_framebuffer_srgb_enabled();
 	bool hdr;
+	bool previous;
 
 	if (!sw)
 		return;
@@ -714,24 +822,29 @@ void hdrp_switcher_render(struct hdrp_switcher *sw)
 		xf_texrender_release(sw);
 
 	active = hdrp_switcher_active_child(sw);
+	if (!active)
+		return;
+
+	cw = obs_source_get_width(active);
+	ch = obs_source_get_height(active);
+
+	/* Output rectangle: the OBS base canvas when adaptive, else native. */
+	ow = (sw->adaptive && sw->out_w) ? sw->out_w : cw;
+	oh = (sw->adaptive && sw->out_h) ? sw->out_h : ch;
+	if (!ow || !oh)
+		return;
+
+	fit_into(cw, ch, ow, oh, &scale, &ox, &oy);
 
 	if (!sw->xfade_active || sw->xfade_out_idx < 0) {
-		if (active)
-			obs_source_video_render(active);
+		render_single(active, scale, ox, oy);
 		return;
 	}
 
-	outgoing = sw->slot[sw->xfade_out_idx];
-	if (!active || !outgoing) {
-		if (active)
-			obs_source_video_render(active);
-		return;
-	}
-
-	w = obs_source_get_width(active);
-	h = obs_source_get_height(active);
-	if (!w || !h) {
-		obs_source_video_render(active);
+	outgoing = (sw->xfade_out_idx >= 0) ? sw->slot[sw->xfade_out_idx] : NULL;
+	if (!outgoing || outgoing == active) {
+		sw->xfade_active = false;
+		render_single(active, scale, ox, oy);
 		return;
 	}
 
@@ -739,15 +852,21 @@ void hdrp_switcher_render(struct hdrp_switcher *sw)
 	hdr = space != GS_CS_SRGB;
 	fmt = gs_get_format_from_space(space);
 
-	xf_size((int)w, (int)h, &tw, &th);
+	/* Intermediate at the output aspect, capped (see HDRP_XF_MAX_*). */
+	xf_size((int)ow, (int)oh, &tw, &th);
 	xf_texrender_ensure(sw, tw, th, fmt);
 
-	render_child_to_tex(sw, outgoing, tw, th, 0, space);
-	render_child_to_tex(sw, active, tw, th, 1, space);
+	/* Map the output-space fit into intermediate pixels. */
+	is = scale * ((float)tw / (float)ow);
+	ix = ox * ((float)tw / (float)ow);
+	iy = oy * ((float)th / (float)oh);
+
+	render_child_to_tex(sw, outgoing, tw, th, 0, space, is, ix, iy);
+	render_child_to_tex(sw, active, tw, th, 1, space, is, ix, iy);
 
 	if ((sw->xf_tex_valid & 3) != 3) {
 		sw->xfade_active = false;
-		obs_source_video_render(active);
+		render_single(active, scale, ox, oy);
 		return;
 	}
 
@@ -755,7 +874,7 @@ void hdrp_switcher_render(struct hdrp_switcher *sw)
 	b = gs_texrender_get_texture(sw->xf_tex[1]);
 	if (!a || !b) {
 		sw->xfade_active = false;
-		obs_source_video_render(active);
+		render_single(active, scale, ox, oy);
 		return;
 	}
 
@@ -765,6 +884,7 @@ void hdrp_switcher_render(struct hdrp_switcher *sw)
 	if (t > 1.0f)
 		t = 1.0f;
 
+	previous = gs_framebuffer_srgb_enabled();
 	gs_enable_framebuffer_srgb(true);
 	if (hdr) {
 		gs_effect_set_texture_srgb(sw->xf.tex_a, a);
@@ -777,7 +897,7 @@ void hdrp_switcher_render(struct hdrp_switcher *sw)
 	while (gs_effect_loop(sw->xf.effect,
 			      (hdr && sw->xf.linear_tech) ? "FadeLinear"
 							  : "Fade"))
-		gs_draw_sprite(NULL, 0, (uint32_t)w, (uint32_t)h);
+		gs_draw_sprite(NULL, 0, ow, oh);
 	gs_enable_framebuffer_srgb(previous);
 }
 

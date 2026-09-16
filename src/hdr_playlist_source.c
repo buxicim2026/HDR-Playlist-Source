@@ -38,6 +38,8 @@
 #define KEY_VISIBILITY     "visibility"
 #define KEY_MIXED          "mixed_content"
 #define KEY_SAVED_INDEX    "saved_index"
+#define KEY_ADAPT_CANVAS   "adapt_canvas"
+#define KEY_DEINTERLACE    "deinterlace"
 
 enum {
 	VIS_STOP_RESTART = 0,
@@ -69,6 +71,14 @@ struct hdr_playlist {
 	bool low_memory;
 	int visibility;
 	int mixed;
+	bool adapt_canvas;
+	int deinterlace_mode;
+
+	/* cached OBS output configuration */
+	bool output_hdr;
+	uint32_t canvas_w;
+	uint32_t canvas_h;
+	bool cfg_logged;
 
 	obs_hotkey_id hk_play_pause;
 	obs_hotkey_id hk_restart;
@@ -79,6 +89,8 @@ struct hdr_playlist {
 	bool showing;
 	bool stopped;
 	bool need_preload_retry;
+	float hb_seconds;   /* diagnostics heartbeat */
+	int64_t hb_last_pos; /* position at the previous heartbeat (ms) */
 };
 
 /* ------------------------------------------------------------------ */
@@ -97,6 +109,59 @@ static void hdrp_apply_opts(const struct hdr_playlist *p,
 	opts->hw_decode = p->hw_decode;
 	opts->speed_percent = p->speed_percent;
 	opts->clear_on_end = false;
+}
+
+/* Is OBS configured to *output* HDR? (Advanced -> Color Format P010/I010/...
+ * together with Rec.2100 PQ/HLG.) Everything else is treated as SDR. */
+static bool hdrp_output_is_hdr(const struct obs_video_info *ovi)
+{
+	switch (ovi->output_format) {
+	case VIDEO_FORMAT_P010:
+	case VIDEO_FORMAT_I010:
+	case VIDEO_FORMAT_I210:
+	case VIDEO_FORMAT_I412:
+	case VIDEO_FORMAT_YA2L:
+	case VIDEO_FORMAT_R10L:
+		break;
+	default:
+		return false;
+	}
+	return ovi->colorspace == VIDEO_CS_2100_PQ ||
+	       ovi->colorspace == VIDEO_CS_2100_HLG;
+}
+
+/* Reads the OBS canvas/output configuration and pushes it into the switcher:
+ *   * the source reports (and renders at) the base canvas resolution, so the
+ *     compositor stays 1:1 instead of scaling a native 4K frame every frame;
+ *   * whether the session is HDR decides how color spaces are reported.
+ * Called from update() and every tick; obs_get_video_info() is cheap. */
+static void hdrp_sync_output_config(struct hdr_playlist *p)
+{
+	struct obs_video_info ovi;
+
+	if (!p || !obs_get_video_info(&ovi))
+		return;
+
+	bool hdr = hdrp_output_is_hdr(&ovi);
+	if (!p->cfg_logged || hdr != p->output_hdr ||
+	    ovi.base_width != p->canvas_w ||
+	    ovi.base_height != p->canvas_h) {
+		p->output_hdr = hdr;
+		p->canvas_w = ovi.base_width;
+		p->canvas_h = ovi.base_height;
+		blog(LOG_INFO,
+		     "[HDR-PL] canvas %ux%u, output %ux%u, format=%d "
+		     "colorspace=%d -> %s session",
+		     ovi.base_width, ovi.base_height, ovi.output_width,
+		     ovi.output_height, (int)ovi.output_format,
+		     (int)ovi.colorspace, hdr ? "HDR" : "SDR");
+		p->cfg_logged = true;
+	}
+
+	/* Always report the canvas size so the video adapts to any canvas; the
+	 * adaptive flag only controls whether we override the native size. */
+	hdrp_switcher_set_output_size(p->sw, p->canvas_w, p->canvas_h,
+				      p->adapt_canvas);
 }
 
 /* Make the playlist cursor point at `path`; returns index or SIZE_MAX. */
@@ -209,7 +274,14 @@ static void hdrp_start_current(struct hdr_playlist *p)
 
 	hdrp_apply_opts(p, &opts);
 
+	{
+		char *name = hdrp_basename_dup(path);
+		blog(LOG_INFO, "[HDR-PL] playing '%s'", name);
+		bfree(name);
+	}
+
 	p->stopped = false;
+	p->hb_seconds = 0.0f;
 	hdrp_switcher_play(p->sw, path, &opts);
 	if (p->au)
 		hdrp_attach_audio_to_active(p);
@@ -432,6 +504,7 @@ static void *hdrp_create(obs_data_t *settings, obs_source_t *source)
 	p->low_memory = true; /* memory-first default: one decoder, no preload */
 	p->visibility = VIS_STOP_RESTART;
 	p->mixed = MIXED_AUTO;
+	p->adapt_canvas = true;
 	p->stopped = true;
 
 	hdrp_switcher_set_transition_ms(p->sw, 0);
@@ -453,6 +526,7 @@ static void *hdrp_create(obs_data_t *settings, obs_source_t *source)
 		obs_module_text("HotkeyPrev"), hotkey_prev, p);
 
 	hdrp_update(p, settings);
+	hdrp_sync_output_config(p);
 	return p;
 }
 
@@ -494,6 +568,8 @@ static void hdrp_update(void *data, obs_data_t *settings)
 	p->low_memory = obs_data_get_bool(settings, KEY_LOW_MEMORY);
 	p->visibility = (int)obs_data_get_int(settings, KEY_VISIBILITY);
 	p->mixed = (int)obs_data_get_int(settings, KEY_MIXED);
+	p->adapt_canvas = obs_data_get_bool(settings, KEY_ADAPT_CANVAS);
+	p->deinterlace_mode = (int)obs_data_get_int(settings, KEY_DEINTERLACE);
 
 	if (files_list_changed(p, settings)) {
 		load_files_from_settings(p, settings);
@@ -507,6 +583,9 @@ static void hdrp_update(void *data, obs_data_t *settings)
 	/* Memory: without preloading the second decoder is destroyed and the
 	 * plugin runs a single ffmpeg instance. */
 	hdrp_switcher_set_preload_enabled(p->sw, !p->low_memory);
+	hdrp_switcher_set_deinterlace(p->sw, p->deinterlace_mode);
+
+	hdrp_sync_output_config(p);
 
 	if (list_changed)
 		hdrp_playlist_changed(p);
@@ -576,6 +655,7 @@ static void hdrp_video_tick(void *data, float seconds)
 	if (!p)
 		return;
 
+	hdrp_sync_output_config(p);
 	hdrp_switcher_tick(p->sw, seconds);
 
 	if (hdrp_switcher_consume_promote_event(p->sw))
@@ -589,6 +669,41 @@ static void hdrp_video_tick(void *data, float seconds)
 
 	if (p->low_memory && !p->stopped)
 		hdrp_switcher_idle_stop_if_playing(p->sw);
+
+	/* Diagnostics: one line every 5 s. If "pos" stops advancing the decode
+	 * stalled; if "fill" stays at the ring capacity the audio consumer is
+	 * not running; "state" tells whether the media source is playing. */
+	if (!p->stopped) {
+		p->hb_seconds += seconds;
+		if (p->hb_seconds >= 5.0f) {
+			const char *path = hdrp_switcher_active_path(p->sw);
+			char *name = path ? hdrp_basename_dup(path) : NULL;
+			enum obs_media_state st = hdrp_switcher_get_state(p->sw);
+			int64_t pos = hdrp_switcher_get_time(p->sw);
+			bool stuck = st == OBS_MEDIA_STATE_PLAYING &&
+				     pos == p->hb_last_pos;
+			p->hb_seconds = 0.0f;
+			p->hb_last_pos = pos;
+			blog(stuck || st == OBS_MEDIA_STATE_ERROR
+				     ? LOG_WARNING
+				     : LOG_INFO,
+			     "[HDR-PL] hb: '%s' state=%d pos=%.1fs dur=%.1fs "
+			     "audio=%uch fill=%zu canvas=%ux%u %s%s",
+			     name ? name : "(none)", (int)st,
+			     (double)pos / 1000.0,
+			     (double)hdrp_switcher_get_duration(p->sw) / 1000.0,
+			     hdrp_audio_channels(p->au), hdrp_audio_fill(p->au),
+			     p->canvas_w, p->canvas_h,
+			     p->output_hdr ? "HDR" : "SDR",
+			     stuck ? " [position not advancing - decode too "
+				     "slow for this resolution]"
+				   : "");
+			bfree(name);
+		}
+	} else {
+		p->hb_seconds = 0.0f;
+		p->hb_last_pos = 0;
+	}
 }
 
 static void hdrp_video_render(void *data, gs_effect_t *effect)
@@ -645,6 +760,12 @@ hdrp_video_get_color_space(void *data, size_t count,
 {
 	struct hdr_playlist *p = data;
 	if (!p || !preferred_spaces || count == 0)
+		return GS_CS_SRGB;
+
+	/* If OBS is not configured to output HDR (e.g. a 1080p Rec.709
+	 * stream), everything is played as SDR: OBS then tonemaps HDR clips
+	 * down the normal way instead of us pretending to be HDR. */
+	if (!p->output_hdr)
 		return GS_CS_SRGB;
 
 	/* OBS 31 only distinguishes SDR from HDR at the source level; the
@@ -757,6 +878,9 @@ static void hdrp_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, KEY_LOW_MEMORY, true);
 	obs_data_set_default_int(settings, KEY_VISIBILITY, VIS_STOP_RESTART);
 	obs_data_set_default_int(settings, KEY_MIXED, MIXED_AUTO);
+	obs_data_set_default_bool(settings, KEY_ADAPT_CANVAS, true);
+	obs_data_set_default_int(settings, KEY_DEINTERLACE,
+				 OBS_DEINTERLACE_MODE_DISABLE);
 	obs_data_set_default_int(settings, KEY_SAVED_INDEX, -1);
 }
 
@@ -781,6 +905,8 @@ static obs_properties_t *hdrp_properties(void *data)
 	obs_property_t *dur;
 	obs_property_t *vis;
 	obs_property_t *mixed;
+	obs_property_t *adapt;
+	obs_property_t *deint;
 
 	UNUSED_PARAMETER(data);
 	obs_properties_set_flags(props, OBS_PROPERTIES_DEFER_UPDATE);
@@ -825,6 +951,24 @@ static obs_properties_t *hdrp_properties(void *data)
 	obs_properties_add_bool(props, KEY_LOW_MEMORY,
 				obs_module_text("LowMemory"));
 
+	adapt = obs_properties_add_bool(props, KEY_ADAPT_CANVAS,
+					obs_module_text("AdaptToCanvas"));
+	obs_property_set_long_description(
+		adapt, obs_module_text("AdaptToCanvasHint"));
+
+	obs_properties_add_list(props, KEY_DEINTERLACE,
+				obs_module_text("Deinterlace"),
+				OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	deint = obs_properties_get(props, KEY_DEINTERLACE);
+	obs_property_set_long_description(deint,
+					  obs_module_text("DeinterlaceHint"));
+	obs_property_list_add_int(deint, obs_module_text("DeintOff"),
+				  OBS_DEINTERLACE_MODE_DISABLE);
+	obs_property_list_add_int(deint, obs_module_text("DeintLinear"),
+				  OBS_DEINTERLACE_MODE_LINEAR);
+	obs_property_list_add_int(deint, obs_module_text("DeintYadif"),
+				  OBS_DEINTERLACE_MODE_YADIF);
+
 	obs_properties_add_list(props, KEY_VISIBILITY,
 				obs_module_text("Visibility"),
 				OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
@@ -842,6 +986,8 @@ static obs_properties_t *hdrp_properties(void *data)
 				obs_module_text("MixedContent"),
 				OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	mixed = obs_properties_get(props, KEY_MIXED);
+	obs_property_set_long_description(
+		mixed, obs_module_text("MixedContentHint"));
 	obs_property_list_add_int(mixed, obs_module_text("MixedAuto"),
 				  MIXED_AUTO);
 	obs_property_list_add_int(mixed, obs_module_text("MixedForcePQ"),
