@@ -45,3 +45,13 @@ bool hdrp_audio_render(struct hdrp_audio *au, uint64_t *ts_out,
 /* Diagnostics. */
 size_t hdrp_audio_fill(struct hdrp_audio *au);     /* buffered frames */
 uint32_t hdrp_audio_channels(struct hdrp_audio *au);
+/* True once the child's capture callback has delivered audio. */
+bool hdrp_audio_capture_active(struct hdrp_audio *au);
+
+/* Fallback path: read the child's own mixed audio buffer directly
+ * (obs_source_get_audio_mix). Used when the capture callback never fired, so
+ * a missed callback can never silence the source. Returns false if `child` is
+ * NULL or has no audio buffer. */
+bool hdrp_audio_render_from_child(struct hdrp_audio *au, obs_source_t *child,
+				  struct obs_source_audio_mix *audio_output,
+				  uint32_t mixers, size_t channels);

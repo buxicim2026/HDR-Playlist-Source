@@ -35,6 +35,9 @@ struct hdrp_audio {
 
 	obs_source_t *child; /* currently captured child, or NULL */
 
+	uint64_t renders;        /* audio_render calls (diagnostics) */
+	bool warned_no_data;
+
 	uint64_t ts_next; /* timestamp we hand back to libobs */
 	bool log_once;
 };
@@ -149,6 +152,12 @@ static void on_audio_capture(void *param, obs_source_t *source,
 
 	hdrp_mutex_lock(&au->mtx);
 
+	/* Ignore a callback that raced with a clip switch. */
+	if (au->child != source) {
+		hdrp_mutex_unlock(&au->mtx);
+		return;
+	}
+
 	if (!au->ready || au->channels != channels)
 		ring_alloc(au, channels, rate);
 	if (!au->ready) {
@@ -187,6 +196,7 @@ bool hdrp_audio_render(struct hdrp_audio *au, uint64_t *ts_out,
 	size_t want = AUDIO_OUTPUT_FRAMES;
 	size_t take = 0;
 	uint32_t mix;
+	bool warn_now = false;
 
 	if (ts_out)
 		*ts_out = os_gettime_ns();
@@ -208,6 +218,14 @@ bool hdrp_audio_render(struct hdrp_audio *au, uint64_t *ts_out,
 	}
 
 	hdrp_mutex_lock(&au->mtx);
+
+	/* Diagnostic: the mixer has been asking us for audio for a while but
+	 * the media source never delivered any. */
+	if (!au->ready && !au->warned_no_data && ++au->renders > 500) {
+		au->warned_no_data = true;
+		warn_now = true;
+	}
+
 	take = au->count < want ? au->count : want;
 
 	for (mix = 0; mix < MAX_AUDIO_MIXES; mix++) {
@@ -237,8 +255,62 @@ bool hdrp_audio_render(struct hdrp_audio *au, uint64_t *ts_out,
 	}
 	hdrp_mutex_unlock(&au->mtx);
 
+	if (warn_now)
+		blog(LOG_WARNING, "[HDR-PL] the media source has not delivered "
+				  "any audio yet - check that the file has an "
+				  "audio track and is not muted in the mixer");
+
 	UNUSED_PARAMETER(sample_rate);
 	return true;
+}
+
+bool hdrp_audio_capture_active(struct hdrp_audio *au)
+{
+	bool r;
+	if (!au)
+		return false;
+	hdrp_mutex_lock(&au->mtx);
+	r = au->ready;
+	hdrp_mutex_unlock(&au->mtx);
+	return r;
+}
+
+bool hdrp_audio_render_from_child(struct hdrp_audio *au, obs_source_t *child,
+				  struct obs_source_audio_mix *audio_output,
+				  uint32_t mixers, size_t channels)
+{
+	struct obs_source_audio_mix mix;
+	bool any = false;
+
+	UNUSED_PARAMETER(au);
+	if (!child || !audio_output)
+		return false;
+
+	memset(&mix, 0, sizeof(mix));
+	obs_source_get_audio_mix(child, &mix);
+
+	for (uint32_t i = 0; i < MAX_AUDIO_MIXES; i++) {
+		if ((mixers & (1u << i)) == 0)
+			continue;
+		for (size_t ch = 0; ch < channels; ch++) {
+			const float *src =
+				mix.output[i].data[ch < MAX_AUDIO_CHANNELS
+							   ? ch
+							   : 0];
+			float *dst = audio_output->output[i].data[ch];
+			if (!dst)
+				continue;
+			if (src) {
+				memcpy(dst, src,
+				       AUDIO_OUTPUT_FRAMES * sizeof(float));
+				any = true;
+			} else {
+				memset(dst, 0,
+				       AUDIO_OUTPUT_FRAMES * sizeof(float));
+			}
+		}
+	}
+	return any;
 }
 
 size_t hdrp_audio_fill(struct hdrp_audio *au)
@@ -289,22 +361,32 @@ void hdrp_audio_destroy(struct hdrp_audio *au)
 
 void hdrp_audio_attach(struct hdrp_audio *au, obs_source_t *child)
 {
+	obs_source_t *old;
+
 	if (!au || !child)
 		return;
 
+	/* Swap the target under our lock, but NEVER call into libobs while
+	 * holding it. The capture callback runs with the child's
+	 * audio_cb_mutex held and takes this same lock, so registering from
+	 * inside the critical section is a classic AB-BA deadlock that wedges
+	 * the OBS audio thread — the symptom is total silence while video
+	 * keeps playing. */
 	hdrp_mutex_lock(&au->mtx);
 	if (au->child == child) {
 		hdrp_mutex_unlock(&au->mtx);
 		return;
 	}
-	if (au->child)
-		obs_source_remove_audio_capture_callback(
-			au->child, on_audio_capture, au);
+	old = au->child;
 	au->child = child;
 	au->head = 0;
 	au->count = 0;
-	obs_source_add_audio_capture_callback(child, on_audio_capture, au);
 	hdrp_mutex_unlock(&au->mtx);
+
+	if (old)
+		obs_source_remove_audio_capture_callback(old, on_audio_capture,
+							 au);
+	obs_source_add_audio_capture_callback(child, on_audio_capture, au);
 
 	blog(LOG_INFO, "[HDR-PL] audio capture attached to '%s'",
 	     obs_source_get_name(child));
@@ -316,15 +398,17 @@ void hdrp_audio_detach(struct hdrp_audio *au)
 
 	if (!au)
 		return;
+
 	hdrp_mutex_lock(&au->mtx);
 	child = au->child;
 	au->child = NULL;
 	au->count = 0;
 	au->head = 0;
+	hdrp_mutex_unlock(&au->mtx);
+
 	if (child)
 		obs_source_remove_audio_capture_callback(child,
 							 on_audio_capture, au);
-	hdrp_mutex_unlock(&au->mtx);
 }
 
 void hdrp_audio_flush(struct hdrp_audio *au)

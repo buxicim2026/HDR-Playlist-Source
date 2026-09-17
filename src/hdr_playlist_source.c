@@ -910,8 +910,26 @@ static bool hdrp_source_audio_render(void *data, uint64_t *ts_out,
 				     size_t sample_rate)
 {
 	struct hdr_playlist *p = data;
+
 	if (!p || p->stopped)
 		return false;
+
+	/* Preferred path: the bounded ring buffer fed by the child's audio
+	 * capture callback. */
+	if (hdrp_audio_capture_active(p->au) || hdrp_audio_fill(p->au) > 0)
+		return hdrp_audio_render(p->au, ts_out, audio_output, mixers,
+					 channels, sample_rate);
+
+	/* Safety net: read the child's own mixed audio buffer directly, so a
+	 * capture callback that never fired cannot silence playback. */
+	if (hdrp_audio_render_from_child(p->au,
+					 hdrp_switcher_active_child(p->sw),
+					 audio_output, mixers, channels)) {
+		if (ts_out)
+			*ts_out = os_gettime_ns();
+		return true;
+	}
+
 	return hdrp_audio_render(p->au, ts_out, audio_output, mixers, channels,
 				 sample_rate);
 }
@@ -1062,17 +1080,6 @@ static void hdrp_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, KEY_SAVED_INDEX, -1);
 }
 
-static bool hdrp_play_now_clicked(obs_properties_t *props,
-				  obs_property_t *property, void *data)
-{
-	struct hdr_playlist *p = data;
-	UNUSED_PARAMETER(props);
-	UNUSED_PARAMETER(property);
-	if (p)
-		hdrp_start_current(p);
-	return false;
-}
-
 static obs_properties_t *hdrp_properties(void *data)
 {
 	obs_properties_t *props = obs_properties_create();
@@ -1198,10 +1205,6 @@ static obs_properties_t *hdrp_properties(void *data)
 				  MIXED_FORCE_HLG);
 	obs_property_list_add_int(mixed, obs_module_text("MixedForceSDR"),
 				  MIXED_FORCE_SDR);
-
-	obs_properties_add_button(props, "hdrp_play_now",
-				  obs_module_text("PlayNow"),
-				  hdrp_play_now_clicked);
 
 	return props;
 }
