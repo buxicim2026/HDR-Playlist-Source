@@ -94,6 +94,7 @@ struct hdr_playlist {
 	bool need_preload_retry;
 	float hb_seconds;    /* diagnostics heartbeat */
 	int64_t hb_last_pos; /* position at the previous heartbeat (ms) */
+	bool info_logged;    /* media info for the current clip logged */
 };
 
 /* ------------------------------------------------------------------ */
@@ -112,6 +113,148 @@ static void hdrp_apply_opts(const struct hdr_playlist *p,
 	opts->hw_decode = p->hw_decode;
 	opts->speed_percent = p->speed_percent;
 	opts->clear_on_end = false;
+}
+
+/* ------------------------------------------------------------------ */
+/* media info (properties panel + log)                                 */
+/* ------------------------------------------------------------------ */
+
+static const char *hdrp_space_name(enum gs_color_space cs, bool *is_hdr)
+{
+	if (is_hdr)
+		*is_hdr = cs == GS_CS_709_EXTENDED || cs == GS_CS_709_SCRGB;
+
+	switch (cs) {
+	case GS_CS_SRGB:
+		return "Rec.709 (SDR)";
+	case GS_CS_SRGB_16F:
+		return "sRGB 16F (SDR)";
+	case GS_CS_709_EXTENDED:
+		return "Rec.709 extended (HDR)";
+	case GS_CS_709_SCRGB:
+		return "scRGB (HDR)";
+	}
+	return "unknown";
+}
+
+static const char *hdrp_output_space_name(enum video_colorspace cs)
+{
+	switch (cs) {
+	case VIDEO_CS_2100_PQ:
+		return "Rec.2100 PQ";
+	case VIDEO_CS_2100_HLG:
+		return "Rec.2100 HLG";
+	default:
+		return "Rec.709";
+	}
+}
+
+static const char *hdrp_deint_name(int mode)
+{
+	switch (mode) {
+	case OBS_DEINTERLACE_MODE_DISCARD:
+		return "discard";
+	case OBS_DEINTERLACE_MODE_LINEAR:
+		return "linear";
+	case OBS_DEINTERLACE_MODE_YADIF:
+		return "yadif";
+	case OBS_DEINTERLACE_MODE_LINEAR_2X:
+		return "linear 2x";
+	case OBS_DEINTERLACE_MODE_YADIF_2X:
+		return "yadif 2x";
+	case OBS_DEINTERLACE_MODE_BLEND:
+		return "blend";
+	case OBS_DEINTERLACE_MODE_BLEND_2X:
+		return "blend 2x";
+	default:
+		return "off";
+	}
+}
+
+/* What the presented clip *is*: resolution, colour space, HDR or not, audio
+ * channel count and the deinterlacing currently applied. OBS does not expose a
+ * media file's own frame rate or interlace flag to plugins, so the frame rate
+ * shown is the output (canvas) one. */
+static void hdrp_build_info_media(struct hdr_playlist *p, char *buf,
+				  size_t size)
+{
+	uint32_t mw = 0, mh = 0;
+	enum gs_color_space cs = GS_CS_SRGB;
+	bool hdr = false;
+	const char *csname;
+
+	if (!p || p->stopped || !hdrp_switcher_active_path(p->sw)) {
+		snprintf(buf, size, "%s", obs_module_text("InfoIdle"));
+		return;
+	}
+
+	{
+		const enum gs_color_space pref[1] = { GS_CS_SRGB };
+		cs = hdrp_switcher_content_space(p->sw, 1, pref);
+	}
+	csname = hdrp_space_name(cs, &hdr);
+	hdrp_switcher_get_media_size(p->sw, &mw, &mh);
+
+	snprintf(buf, size, "%ux%u · %s · %s · audio %uch · deint %s", mw, mh,
+		 csname, hdr ? "HDR" : "SDR", hdrp_audio_channels(p->au),
+		 hdrp_deint_name(p->deinterlace_mode));
+}
+
+/* Output side: canvas size/frame rate, output colour space and HDR session. */
+static void hdrp_build_info_output(struct hdr_playlist *p, char *buf,
+				   size_t size)
+{
+	struct obs_video_info ovi;
+	uint32_t fps = 0;
+
+	memset(&ovi, 0, sizeof(ovi));
+	if (!obs_get_video_info(&ovi)) {
+		snprintf(buf, size, "-");
+		return;
+	}
+	if (ovi.fps_den)
+		fps = ovi.fps_num / ovi.fps_den;
+
+	snprintf(buf, size, "%ux%u @ %ufps · %s · %s", ovi.base_width,
+		 ovi.base_height, fps, hdrp_output_space_name(ovi.colorspace),
+		 (p && p->output_hdr) ? "HDR session" : "SDR session");
+}
+
+/* Queued onto the UI thread so we never emit the properties signal from the
+ * graphics thread (and the weak ref keeps this safe if the source dies).
+ * Only called on clip changes / start / stop — never on a timer. */
+static void hdrp_ui_refresh_task(void *param)
+{
+	obs_weak_source_t *weak = param;
+	obs_source_t *src = obs_weak_source_get_source(weak);
+	if (src) {
+		obs_source_update_properties(src);
+		obs_source_release(src);
+	}
+	obs_weak_source_release(weak);
+}
+
+static void hdrp_queue_props_refresh(struct hdr_playlist *p)
+{
+	obs_weak_source_t *w;
+
+	if (!p || !p->source)
+		return;
+	w = obs_source_get_weak_source(p->source);
+	if (w)
+		obs_queue_task(OBS_TASK_UI, hdrp_ui_refresh_task, w, false);
+}
+
+/* "支持我们" — opens the donation page in the user's default browser. */
+static bool hdrp_support_clicked(obs_properties_t *props,
+				 obs_property_t *property, void *data)
+{
+	UNUSED_PARAMETER(props);
+	UNUSED_PARAMETER(property);
+	UNUSED_PARAMETER(data);
+	hdrp_open_url(
+		"https://afdian.com/p/11bd2a72b35211f1b8dc52540025c377");
+	return false;
 }
 
 /* Is OBS configured to *output* HDR? (Advanced -> Color Format P010/I010/...
@@ -326,12 +469,14 @@ static void hdrp_start_current(struct hdr_playlist *p)
 
 	p->stopped = false;
 	p->hb_seconds = 0.0f;
+	p->info_logged = false;
 	hdrp_switcher_play(p->sw, path, &opts);
 	if (p->au)
 		hdrp_attach_audio_to_active(p);
 
 	obs_source_media_started(p->source);
 	p->need_preload_retry = true;
+	hdrp_queue_props_refresh(p);
 }
 
 static void hdrp_stop_playback(struct hdr_playlist *p)
@@ -342,6 +487,7 @@ static void hdrp_stop_playback(struct hdr_playlist *p)
 	}
 	hdrp_switcher_stop(p->sw);
 	p->stopped = true;
+	hdrp_queue_props_refresh(p);
 }
 
 static void hdrp_finish_at_end(struct hdr_playlist *p)
@@ -403,6 +549,8 @@ static void hdrp_switcher_ended(void *opaque)
 	hdrp_attach_audio_to_active(p);
 	obs_source_media_started(p->source);
 	p->need_preload_retry = true;
+	p->info_logged = false;
+	hdrp_queue_props_refresh(p);
 }
 
 static void hdrp_jump(struct hdr_playlist *p, bool forward)
@@ -433,6 +581,8 @@ static void hdrp_jump(struct hdr_playlist *p, bool forward)
 	hdrp_switcher_play(p->sw, target, &opts);
 	hdrp_attach_audio_to_active(p);
 	p->need_preload_retry = true;
+	p->info_logged = false;
+	hdrp_queue_props_refresh(p);
 }
 
 /* The playlist was edited. Make it take effect immediately. */
@@ -797,6 +947,20 @@ static void hdrp_video_tick(void *data, float seconds)
 		p->hb_seconds = 0.0f;
 		p->hb_last_pos = 0;
 	}
+
+	/* Log the clip's media info once per clip, as soon as the media source
+	 * reports a frame size (right after a start it is still 0x0). */
+	if (!p->stopped && !p->info_logged) {
+		uint32_t mw = 0, mh = 0;
+
+		hdrp_switcher_get_media_size(p->sw, &mw, &mh);
+		if (mw && mh) {
+			char info[256];
+			p->info_logged = true;
+			hdrp_build_info_media(p, info, sizeof(info));
+			blog(LOG_INFO, "[HDR-PL] media: %s", info);
+		}
+	}
 }
 
 static void hdrp_video_render(void *data, gs_effect_t *effect)
@@ -995,6 +1159,18 @@ static obs_properties_t *hdrp_properties(void *data)
 		"*.avi *.webm *.gif *.m3u8 *.mpd *.mp3 *.aac *.ogg *.wav "
 		"*.flac *.m4a *.opus)";
 
+	/* Current clip / output info: read when the panel is built, and
+	 * refreshed on clip changes (never on a timer). */
+	{
+		char info[256];
+		hdrp_build_info_media(data, info, sizeof(info));
+		obs_properties_add_text(props, "hdrp_info_media", info,
+					OBS_TEXT_INFO);
+		hdrp_build_info_output(data, info, sizeof(info));
+		obs_properties_add_text(props, "hdrp_info_output", info,
+					OBS_TEXT_INFO);
+	}
+
 	list = obs_properties_add_editable_list(
 		props, KEY_FILES, obs_module_text("PlaylistFiles"),
 		OBS_EDITABLE_LIST_TYPE_FILES, media_filter, NULL);
@@ -1089,6 +1265,13 @@ static obs_properties_t *hdrp_properties(void *data)
 				  MIXED_FORCE_HLG);
 	obs_property_list_add_int(mixed, obs_module_text("MixedForceSDR"),
 				  MIXED_FORCE_SDR);
+
+	/* Credit + donation button (opens the shop page in the browser). */
+	obs_properties_add_text(props, "hdrp_credit",
+				obs_module_text("Credit"), OBS_TEXT_INFO);
+	obs_properties_add_button(props, "hdrp_support",
+				  obs_module_text("SupportUs"),
+				  hdrp_support_clicked);
 
 	return props;
 }

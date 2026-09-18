@@ -26,3 +26,7 @@ void hdrp_mutex_unlock(hdrp_mutex_t *m);
 /* Returns a bstrdup'd basename of `path` (strip leading directories for both
  * '/' and '\\'); free the result with bfree(). Never returns NULL. */
 char *hdrp_basename_dup(const char *path);
+
+/* Opens `url` in the user's default browser (ShellExecute on Windows,
+ * `open` on macOS, `xdg-open` elsewhere). */
+void hdrp_open_url(const char *url);

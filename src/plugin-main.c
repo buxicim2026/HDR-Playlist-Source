@@ -27,8 +27,8 @@ bool obs_module_load(void)
 
 	if (obs_get_version() < HDRP_MIN_OBS_VERSION) {
 		blog(LOG_WARNING,
-		     "[HDR-PL] OBS is older than the required 31.0.0; "
-		     "HDR/gapless features may misbehave");
+		     "[HDR-PL] OBS is older than 30.0.0; this plugin is only "
+		     "tested on OBS 30 and newer");
 	}
 
 	hdrp_register_sources();

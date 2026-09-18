@@ -82,6 +82,11 @@ enum gs_color_space
 hdrp_switcher_content_space(struct hdrp_switcher *sw, size_t count,
 			    const enum gs_color_space *preferred);
 
+/* Native frame size of the presented clip (0x0 while nothing is presented).
+ * Used by the properties panel to show the media info. */
+void hdrp_switcher_get_media_size(struct hdrp_switcher *sw, uint32_t *w,
+				  uint32_t *h);
+
 /* Preload (gapless) control. When disabled the second decoder is destroyed
  * and only re-created if preloading is enabled again — this is the single
  * biggest memory lever, since every ffmpeg_source keeps its own decoded
@@ -92,11 +97,9 @@ void hdrp_switcher_set_preload_enabled(struct hdrp_switcher *sw, bool enable);
  * OBS_DEINTERLACE_MODE_DISABLE for progressive media; interlaced sources look
  * combed without it. Yadif costs GPU time, so it is opt-in. */
 void hdrp_switcher_set_deinterlace(struct hdrp_switcher *sw, int mode);
-int hdrp_switcher_get_deinterlace(const struct hdrp_switcher *sw);
 
 /* Crossfade: 0 disables (hard cut). */
 void hdrp_switcher_set_transition_ms(struct hdrp_switcher *sw, int ms);
-int hdrp_switcher_get_transition_ms(const struct hdrp_switcher *sw);
 
 /* Release the idle decoder (low-memory mode). */
 void hdrp_switcher_idle_stop_if_playing(struct hdrp_switcher *sw);

@@ -13,6 +13,8 @@
 /* OBS source id registered by this plugin. */
 #define HDRP_SOURCE_ID     "hdr_playlist_source"
 
-/* Minimum OBS semantic version: 31.0.0 (P010 HDR + modern media controls).
- * libobs encodes versions as (major<<24)|(minor<<16)|(patch<<8). */
-#define HDRP_MIN_OBS_VERSION ((31u << 24) | (0u << 16) | (0u << 8))
+/* Minimum OBS semantic version: 30.0.0. Everything this plugin uses (color
+ * space API, gs_texrender_begin_with_color_space, media controls) exists in
+ * OBS 30; older versions are untested. libobs encodes versions as
+ * (major<<24)|(minor<<16)|(patch<<8). */
+#define HDRP_MIN_OBS_VERSION ((30u << 24) | (0u << 16) | (0u << 8))

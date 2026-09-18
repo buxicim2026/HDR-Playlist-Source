@@ -221,10 +221,6 @@ void hdrp_switcher_set_deinterlace(struct hdrp_switcher *sw, int mode)
 	blog(LOG_INFO, "[HDR-PL] deinterlace mode set to %d", mode);
 }
 
-int hdrp_switcher_get_deinterlace(const struct hdrp_switcher *sw)
-{
-	return sw ? sw->deinterlace_mode : OBS_DEINTERLACE_MODE_DISABLE;
-}
 
 static void release_slot(struct hdrp_switcher *sw, int idx)
 {
@@ -585,9 +581,15 @@ void hdrp_switcher_set_transition_ms(struct hdrp_switcher *sw, int ms)
 		sw->xfade_ms = ms > 0 ? ms : 0;
 }
 
-int hdrp_switcher_get_transition_ms(const struct hdrp_switcher *sw)
+void hdrp_switcher_get_media_size(struct hdrp_switcher *sw, uint32_t *w,
+				  uint32_t *h)
 {
-	return sw ? sw->xfade_ms : 0;
+	obs_source_t *child = hdrp_switcher_active_child(sw);
+
+	if (w)
+		*w = child ? obs_source_get_width(child) : 0;
+	if (h)
+		*h = child ? obs_source_get_height(child) : 0;
 }
 
 void hdrp_switcher_idle_stop_if_playing(struct hdrp_switcher *sw)

@@ -98,16 +98,6 @@ static bool files_push(struct hdrp_playlist *pl, const char *path)
 	return true;
 }
 
-static void files_erase(struct hdrp_playlist *pl, size_t index)
-{
-	if (index >= pl->count)
-		return;
-	bfree(pl->files[index]);
-	memmove(&pl->files[index], &pl->files[index + 1],
-		(pl->count - index - 1) * sizeof(*pl->files));
-	pl->count--;
-}
-
 /* Join dir + name into out (max out_size). Returns strlen or -1 truncation. */
 static int join_path(char *out, size_t out_size, const char *dir,
 		     const char *name)
@@ -264,23 +254,6 @@ size_t hdrp_playlist_add_folder(struct hdrp_playlist *pl, const char *dir,
 	return expand_dir(pl, dir, max_depth);
 }
 
-void hdrp_playlist_remove(struct hdrp_playlist *pl, size_t index)
-{
-	if (index >= pl->count)
-		return;
-	bool removed_before_current = pl->has_current && index < pl->current;
-	bool removed_current = pl->has_current && index == pl->current;
-	files_erase(pl, index);
-	if (removed_before_current && pl->has_current)
-		pl->current--;
-	else if (removed_current)
-		pl->has_current = false;
-	if (pl->has_current && pl->current >= pl->count) {
-		pl->current = pl->count;
-		pl->has_current = false;
-	}
-}
-
 void hdrp_playlist_clear(struct hdrp_playlist *pl)
 {
 	for (size_t i = 0; i < pl->count; i++)
@@ -306,11 +279,6 @@ void hdrp_playlist_set_mode(struct hdrp_playlist *pl, hdrp_play_mode mode)
 {
 	if (mode <= HDRP_MODE_SHUFFLE)
 		pl->mode = mode;
-}
-
-hdrp_play_mode hdrp_playlist_get_mode(const struct hdrp_playlist *pl)
-{
-	return pl->mode;
 }
 
 bool hdrp_playlist_has_current(const struct hdrp_playlist *pl)
@@ -414,51 +382,4 @@ const char *hdrp_playlist_peek_next(struct hdrp_playlist *pl)
 	return hdrp_playlist_has_current(&tmp) ? tmp.files[tmp.current] : NULL;
 }
 
-void hdrp_playlist_save(struct hdrp_playlist *pl, obs_data_t *settings)
-{
-	obs_data_array_t *arr = obs_data_array_create();
-	for (size_t i = 0; i < pl->count; i++) {
-		obs_data_t *item = obs_data_create();
-		obs_data_set_string(item, "path", pl->files[i]);
-		obs_data_array_push_back(arr, item);
-		obs_data_release(item);
-	}
-	obs_data_set_array(settings, "playlist_files", arr);
-	obs_data_array_release(arr);
-	obs_data_set_int(settings, "playlist_mode", (long long)pl->mode);
-	if (hdrp_playlist_has_current(pl))
-		obs_data_set_int(settings, "playlist_index",
-				 (long long)pl->current);
-	else
-		obs_data_set_int(settings, "playlist_index", -1);
-}
 
-void hdrp_playlist_load(struct hdrp_playlist *pl, obs_data_t *settings)
-{
-	hdrp_playlist_clear(pl);
-
-	obs_data_array_t *arr = obs_data_get_array(settings, "playlist_files");
-	if (arr) {
-		size_t n = obs_data_array_count(arr);
-		for (size_t i = 0; i < n; i++) {
-			obs_data_t *item = obs_data_array_item(arr, i);
-			if (item) {
-				const char *p = obs_data_get_string(item, "path");
-				if (p && *p)
-					files_push(pl, p);
-				obs_data_release(item);
-			}
-		}
-		obs_data_array_release(arr);
-	}
-
-	long long mode = obs_data_get_int(settings, "playlist_mode");
-	if (mode >= HDRP_MODE_SEQUENTIAL && mode <= HDRP_MODE_SHUFFLE)
-		pl->mode = (hdrp_play_mode)mode;
-
-	long long idx = obs_data_get_int(settings, "playlist_index");
-	if (idx >= 0 && (size_t)idx < pl->count) {
-		pl->current = (size_t)idx;
-		pl->has_current = true;
-	}
-}

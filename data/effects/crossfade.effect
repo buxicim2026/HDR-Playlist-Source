@@ -37,11 +37,6 @@ float4 PSCrossfade(FragData f_in) : TARGET {
 	return lerp(a_val, b_val, fade_val);
 }
 
-float4 PSCrossfadeSingle(FragData f_in) : TARGET {
-	float4 a_val = tex_a.Sample(textureSampler, f_in.uv);
-	return a_val * fade_val;
-}
-
 technique Fade {
 	pass {
 		vertex_shader = VSDefault(v_in);
@@ -49,17 +44,11 @@ technique Fade {
 	}
 }
 
-/* Kept as a separate technique so the HDR path keeps working unchanged. */
+/* Kept as a separate technique so the HDR path can opt in later without
+ * touching the effect again. */
 technique FadeLinear {
 	pass {
 		vertex_shader = VSDefault(v_in);
 		pixel_shader = PSCrossfade(f_in);
-	}
-}
-
-technique FadeSingle {
-	pass {
-		vertex_shader = VSDefault(v_in);
-		pixel_shader = PSCrossfadeSingle(f_in);
 	}
 }

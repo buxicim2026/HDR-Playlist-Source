@@ -50,7 +50,9 @@ set_target_properties(hdr-playlist-source PROPERTIES
   OUTPUT_NAME "HDR-Playlist-Source")
 
 if(WIN32)
-  # No extra system libs: threading uses CRITICAL_SECTION, no sockets.
+  # No extra system libs besides shell32 (used for the "Support us" button,
+  # which opens the donation page in the default browser).
+  target_link_libraries(hdr-playlist-source PRIVATE shell32)
   if(OBS_IMPORT_LIB)
     target_link_libraries(hdr-playlist-source PRIVATE "${OBS_IMPORT_LIB}")
   else()

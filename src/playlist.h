@@ -26,7 +26,6 @@ void hdrp_playlist_destroy(struct hdrp_playlist *pl);
 bool hdrp_playlist_add_file(struct hdrp_playlist *pl, const char *path);
 size_t hdrp_playlist_add_folder(struct hdrp_playlist *pl, const char *dir,
 				int max_depth); /* returns #files added */
-void hdrp_playlist_remove(struct hdrp_playlist *pl, size_t index);
 void hdrp_playlist_clear(struct hdrp_playlist *pl);
 
 size_t hdrp_playlist_count(const struct hdrp_playlist *pl);
@@ -34,7 +33,6 @@ size_t hdrp_playlist_count(const struct hdrp_playlist *pl);
 const char *hdrp_playlist_at(const struct hdrp_playlist *pl, size_t index);
 
 void hdrp_playlist_set_mode(struct hdrp_playlist *pl, hdrp_play_mode mode);
-hdrp_play_mode hdrp_playlist_get_mode(const struct hdrp_playlist *pl);
 
 /* "Cursor" management. */
 bool hdrp_playlist_has_current(const struct hdrp_playlist *pl);
@@ -49,10 +47,6 @@ const char *hdrp_playlist_previous(struct hdrp_playlist *pl);
  * that would play next, or NULL at the end of SEQUENTIAL mode. The pointer
  * stays valid until the list is mutated. */
 const char *hdrp_playlist_peek_next(struct hdrp_playlist *pl);
-
-/* Persistence: array of {"path": <str>} plus mode/index fields. */
-void hdrp_playlist_save(struct hdrp_playlist *pl, obs_data_t *settings);
-void hdrp_playlist_load(struct hdrp_playlist *pl, obs_data_t *settings);
 
 /* True if `path` is a media file we can play (extension filter). */
 bool hdrp_playlist_is_supported_file(const char *path);
