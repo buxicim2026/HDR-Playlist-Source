@@ -4,11 +4,12 @@
  * Owns:
  *   * playlist model      (playlist.c)
  *   * A/B media switcher  (switcher.c)
- *   * audio ring buffer   (audio.c)
+ *   * audio forwarding    (audio.c)
  *
  * The parent never touches pixels and never resamples audio: video comes from
  * private ffmpeg_source children through OBS's own HDR pipeline, and audio is
- * pulled from a small ring buffer by the `audio_render` callback.
+ * taken from the presented child's own mix (obs_source_get_audio_mix), i.e.
+ * exactly what a scene does for each of its items. See audio.h.
  */
 
 #include <stdio.h>
@@ -93,7 +94,6 @@ struct hdr_playlist {
 	bool need_preload_retry;
 	float hb_seconds;    /* diagnostics heartbeat */
 	int64_t hb_last_pos; /* position at the previous heartbeat (ms) */
-	float props_seconds; /* throttles the properties refresh */
 };
 
 /* ------------------------------------------------------------------ */
@@ -112,79 +112,6 @@ static void hdrp_apply_opts(const struct hdr_playlist *p,
 	opts->hw_decode = p->hw_decode;
 	opts->speed_percent = p->speed_percent;
 	opts->clear_on_end = false;
-}
-
-/* ------------------------------------------------------------------ */
-/* properties panel status                                             */
-/* ------------------------------------------------------------------ */
-
-static void hdrp_build_now_playing(struct hdr_playlist *p, char *buf,
-				   size_t size)
-{
-	const char *path;
-	char *name;
-	int64_t dur, pos;
-	size_t idx;
-
-	if (!p || p->stopped || !(path = hdrp_switcher_active_path(p->sw))) {
-		snprintf(buf, size, "%s", obs_module_text("StatusIdle"));
-		return;
-	}
-
-	name = hdrp_basename_dup(path);
-	dur = hdrp_switcher_get_duration(p->sw);
-	pos = hdrp_switcher_get_time(p->sw);
-	idx = hdrp_playlist_has_current(p->pl)
-		      ? hdrp_playlist_current_index(p->pl) + 1
-		      : 0;
-
-	if (dur > 0) {
-		int pct = (int)((pos * 100) / dur);
-		snprintf(buf, size, "%s  [%zu/%zu]  %llds / %llds  (%d%%)",
-			 name, idx, hdrp_playlist_count(p->pl),
-			 (long long)(pos / 1000), (long long)(dur / 1000), pct);
-	} else {
-		snprintf(buf, size, "%s  [%zu/%zu]  %llds  (%s)", name, idx,
-			 hdrp_playlist_count(p->pl), (long long)(pos / 1000),
-			 obs_module_text("StatusLive"));
-	}
-	bfree(name);
-}
-
-static void hdrp_build_session_info(struct hdr_playlist *p, char *buf,
-				    size_t size)
-{
-	if (!p) {
-		snprintf(buf, size, "-");
-		return;
-	}
-	snprintf(buf, size, "%ux%u · %s · %s", p->canvas_w, p->canvas_h,
-		 p->output_hdr ? "HDR" : "SDR",
-		 p->low_memory ? "low-mem" : "gapless");
-}
-
-/* Queued onto the UI thread so we never emit the properties signal from the
- * graphics thread (and the weak ref keeps this safe if the source dies). */
-static void hdrp_ui_refresh_task(void *param)
-{
-	obs_weak_source_t *weak = param;
-	obs_source_t *src = obs_weak_source_get_source(weak);
-	if (src) {
-		obs_source_update_properties(src);
-		obs_source_release(src);
-	}
-	obs_weak_source_release(weak);
-}
-
-static void hdrp_queue_props_refresh(struct hdr_playlist *p)
-{
-	obs_weak_source_t *w;
-
-	if (!p || !p->source)
-		return;
-	w = obs_source_get_weak_source(p->source);
-	if (w)
-		obs_queue_task(OBS_TASK_UI, hdrp_ui_refresh_task, w, false);
 }
 
 /* Is OBS configured to *output* HDR? (Advanced -> Color Format P010/I010/...
@@ -405,7 +332,6 @@ static void hdrp_start_current(struct hdr_playlist *p)
 
 	obs_source_media_started(p->source);
 	p->need_preload_retry = true;
-	hdrp_queue_props_refresh(p);
 }
 
 static void hdrp_stop_playback(struct hdr_playlist *p)
@@ -416,7 +342,6 @@ static void hdrp_stop_playback(struct hdr_playlist *p)
 	}
 	hdrp_switcher_stop(p->sw);
 	p->stopped = true;
-	hdrp_queue_props_refresh(p);
 }
 
 static void hdrp_finish_at_end(struct hdr_playlist *p)
@@ -478,7 +403,6 @@ static void hdrp_switcher_ended(void *opaque)
 	hdrp_attach_audio_to_active(p);
 	obs_source_media_started(p->source);
 	p->need_preload_retry = true;
-	hdrp_queue_props_refresh(p);
 }
 
 static void hdrp_jump(struct hdr_playlist *p, bool forward)
@@ -509,7 +433,6 @@ static void hdrp_jump(struct hdr_playlist *p, bool forward)
 	hdrp_switcher_play(p->sw, target, &opts);
 	hdrp_attach_audio_to_active(p);
 	p->need_preload_retry = true;
-	hdrp_queue_props_refresh(p);
 }
 
 /* The playlist was edited. Make it take effect immediately. */
@@ -871,17 +794,6 @@ static void hdrp_video_tick(void *data, float seconds)
 		p->hb_last_pos = 0;
 	}
 
-	/* Keep the properties panel's progress readout ticking (1 Hz, and
-	 * only while playing — the refresh is queued onto the UI thread). */
-	if (!p->stopped) {
-		p->props_seconds += seconds;
-		if (p->props_seconds >= 1.0f) {
-			p->props_seconds = 0.0f;
-			hdrp_queue_props_refresh(p);
-		}
-	} else {
-		p->props_seconds = 0.0f;
-	}
 }
 
 static void hdrp_video_render(void *data, gs_effect_t *effect)
@@ -910,26 +822,29 @@ static bool hdrp_source_audio_render(void *data, uint64_t *ts_out,
 				     size_t sample_rate)
 {
 	struct hdr_playlist *p = data;
+	obs_source_t *child;
 
 	if (!p || p->stopped)
 		return false;
 
-	/* Preferred path: the bounded ring buffer fed by the child's audio
-	 * capture callback. */
-	if (hdrp_audio_capture_active(p->au) || hdrp_audio_fill(p->au) > 0)
-		return hdrp_audio_render(p->au, ts_out, audio_output, mixers,
-					 channels, sample_rate);
-
-	/* Safety net: read the child's own mixed audio buffer directly, so a
-	 * capture callback that never fired cannot silence playback. */
-	if (hdrp_audio_render_from_child(p->au,
-					 hdrp_switcher_active_child(p->sw),
-					 audio_output, mixers, channels)) {
-		if (ts_out)
-			*ts_out = os_gettime_ns();
+	/* Primary path: hand the child's own audio mix over to the mixer.
+	 *
+	 * The presented clip is one of our children, and our
+	 * enum_active_sources() puts it in this source's active tree, so libobs
+	 * renders its audio on every audio tick: resampled to the mixer rate,
+	 * buffered with libobs' own timestamp handling, and aligned with every
+	 * other source in the scene. This is byte-for-byte what a scene does
+	 * for each of its items, so our source behaves like a normal media
+	 * source instead of inventing its own clock (which is what silently
+	 * dropped the audio before: a timestamp outside the current mix window
+	 * makes libobs skip the source). */
+	child = hdrp_switcher_active_child(p->sw);
+	if (hdrp_audio_copy_child(child, ts_out, audio_output, mixers, channels))
 		return true;
-	}
 
+	/* Fallback: our own ring buffer, fed by the child's capture callback.
+	 * Used while the child has nothing buffered yet (clip start, audio-less
+	 * file, stream reconnect). */
 	return hdrp_audio_render(p->au, ts_out, audio_output, mixers, channels,
 				 sample_rate);
 }
@@ -1099,17 +1014,6 @@ static obs_properties_t *hdrp_properties(void *data)
 		"Media files (*.mp4 *.m4v *.ts *.m2ts *.mov *.mxf *.flv *.mkv "
 		"*.avi *.webm *.gif *.m3u8 *.mpd *.mp3 *.aac *.ogg *.wav "
 		"*.flac *.m4a *.opus)";
-
-	/* Live status: current file + progress, and the detected session. */
-	{
-		char status[256];
-		hdrp_build_now_playing(data, status, sizeof(status));
-		obs_properties_add_text(props, "hdrp_status_now", status,
-					OBS_TEXT_INFO);
-		hdrp_build_session_info(data, status, sizeof(status));
-		obs_properties_add_text(props, "hdrp_status_session", status,
-					OBS_TEXT_INFO);
-	}
 
 	list = obs_properties_add_editable_list(
 		props, KEY_FILES, obs_module_text("PlaylistFiles"),

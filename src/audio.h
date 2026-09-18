@@ -1,21 +1,21 @@
 /*
- * audio.h — audio forwarding using a bounded ring buffer.
+ * audio.h — audio forwarding from the presented clip to the parent source.
  *
- * Why this design (rewrite of the original capture+re-emit approach):
+ * Two paths, in order of preference:
  *
- *   The previous version called obs_source_output_audio() from inside the
- *   child's audio capture callback, i.e. from the ffmpeg decode thread.
- *   That drags libobs' whole async audio pipeline (resampler setup, deque
- *   placement, timestamp smoothing, "audio is lagging" recovery) onto a
- *   foreign thread, and any mistake in samples_per_sec silently drops the
- *   audio.
+ *  1. Pull the child's own mix. The slot children are registered as active
+ *     children (obs_source_add_active_child + enum_active_sources), so libobs
+ *     already renders their audio on every audio tick: it resamples to the
+ *     mixer rate and stores the result, timestamped in its own timeline, in
+ *     the child's obs_source_audio_mix. Copying that out is exactly what a
+ *     scene does for each of its items, so the parent ends up behaving like a
+ *     plain media source: same rate, same clock, same mixer alignment.
  *
- *   Instead we now use the *pull* model: the child's audio capture callback
- *   only copies PCM into our own bounded ring buffer, and the parent
- *   implements the `audio_render` source callback, which libobs invokes on
- *   the audio thread. No resampler, no deque, no timestamp heuristics, and
- *   libobs skips all of its recovery logic for sources with an audio_render
- *   callback.
+ *  2. Fallback ring buffer, fed by the child's audio capture callback, used
+ *     only while the child has nothing buffered yet (clip start, audio-less
+ *     file, stream reconnect). That path has to invent its own timestamp,
+ *     which is why it is not the primary one: libobs aligns every source by
+ *     timestamp, and a value outside the current mix window drops the audio.
  */
 #pragma once
 
@@ -37,7 +37,16 @@ void hdrp_audio_detach(struct hdrp_audio *au);
 /* Drop everything buffered (clip change / stop). */
 void hdrp_audio_flush(struct hdrp_audio *au);
 
-/* Use this as the parent source's `audio_render` callback. */
+/* Primary path: copy the child's current audio mix into the parent's
+ * audio_render output and report the child's timestamp. Returns false when the
+ * child has no audio to hand over right now (libobs then treats the parent as
+ * having no audio for this tick, which is what a real media source does). */
+bool hdrp_audio_copy_child(obs_source_t *child, uint64_t *ts_out,
+			   struct obs_source_audio_mix *audio_output,
+			   uint32_t mixers, size_t channels);
+
+/* Fallback path: emit from our own ring buffer. Returns false when there is
+ * nothing buffered. */
 bool hdrp_audio_render(struct hdrp_audio *au, uint64_t *ts_out,
 		       struct obs_source_audio_mix *audio_output,
 		       uint32_t mixers, size_t channels, size_t sample_rate);
@@ -47,11 +56,3 @@ size_t hdrp_audio_fill(struct hdrp_audio *au);     /* buffered frames */
 uint32_t hdrp_audio_channels(struct hdrp_audio *au);
 /* True once the child's capture callback has delivered audio. */
 bool hdrp_audio_capture_active(struct hdrp_audio *au);
-
-/* Fallback path: read the child's own mixed audio buffer directly
- * (obs_source_get_audio_mix). Used when the capture callback never fired, so
- * a missed callback can never silence the source. Returns false if `child` is
- * NULL or has no audio buffer. */
-bool hdrp_audio_render_from_child(struct hdrp_audio *au, obs_source_t *child,
-				  struct obs_source_audio_mix *audio_output,
-				  uint32_t mixers, size_t channels);

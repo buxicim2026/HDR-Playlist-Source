@@ -198,24 +198,8 @@ bool hdrp_audio_render(struct hdrp_audio *au, uint64_t *ts_out,
 	uint32_t mix;
 	bool warn_now = false;
 
-	if (ts_out)
-		*ts_out = os_gettime_ns();
-
-	if (!au || !audio_output) {
-		if (audio_output) {
-			for (mix = 0; mix < MAX_AUDIO_MIXES; mix++) {
-				if ((mixers & (1u << mix)) == 0)
-					continue;
-				for (size_t ch = 0; ch < channels; ch++) {
-					if (audio_output->output[mix].data[ch])
-						memset(audio_output->output[mix]
-							       .data[ch],
-						       0, want * sizeof(float));
-				}
-			}
-		}
-		return true;
-	}
+	if (!au || !audio_output)
+		return false;
 
 	hdrp_mutex_lock(&au->mtx);
 
@@ -228,39 +212,54 @@ bool hdrp_audio_render(struct hdrp_audio *au, uint64_t *ts_out,
 
 	take = au->count < want ? au->count : want;
 
+	/* Nothing buffered: report "no audio" instead of handing the mixer a
+	 * block of silence stamped with a made-up timestamp. libobs aligns
+	 * sources by that timestamp, so a stale value can shift us out of the
+	 * current mix window (silence) or make the scene compute an out-of-
+	 * range offset. Reporting false makes us behave like a media source
+	 * that simply has not produced anything yet. */
+	if (take == 0) {
+		hdrp_mutex_unlock(&au->mtx);
+		if (warn_now)
+			blog(LOG_WARNING,
+			     "[HDR-PL] the media source has not delivered any "
+			     "audio yet - check that the file has an audio "
+			     "track and is not muted in the mixer");
+		return false;
+	}
+
 	for (mix = 0; mix < MAX_AUDIO_MIXES; mix++) {
 		size_t ch;
 		if ((mixers & (1u << mix)) == 0)
 			continue;
 		for (ch = 0; ch < channels; ch++) {
 			float *dst = audio_output->output[mix].data[ch];
+			uint32_t srcch;
 			if (!dst)
 				continue;
-			if (take && au->ready) {
-				uint32_t srcch =
-					ch < au->channels
-						? (uint32_t)ch
-						: au->channels - 1;
-				ring_read(au, srcch, dst, take);
-			}
+			srcch = ch < au->channels ? (uint32_t)ch
+						  : au->channels - 1;
+			ring_read(au, srcch, dst, take);
 			if (take < want)
 				memset(dst + take, 0,
 				       (want - take) * sizeof(float));
 		}
 	}
 
-	if (take) {
-		au->head = (au->head + take) % au->cap_frames;
-		au->count -= take;
+	if (ts_out) {
+		/* Continuous playback clock: this block starts where the
+		 * previous one ended. */
+		if (!au->ts_next)
+			au->ts_next = os_gettime_ns();
+		*ts_out = au->ts_next;
+		au->ts_next += (uint64_t)((take * 1000000000ULL) /
+					  (sample_rate ? sample_rate : 48000));
 	}
+
+	au->head = (au->head + take) % au->cap_frames;
+	au->count -= take;
 	hdrp_mutex_unlock(&au->mtx);
 
-	if (warn_now)
-		blog(LOG_WARNING, "[HDR-PL] the media source has not delivered "
-				  "any audio yet - check that the file has an "
-				  "audio track and is not muted in the mixer");
-
-	UNUSED_PARAMETER(sample_rate);
 	return true;
 }
 
@@ -275,15 +274,24 @@ bool hdrp_audio_capture_active(struct hdrp_audio *au)
 	return r;
 }
 
-bool hdrp_audio_render_from_child(struct hdrp_audio *au, obs_source_t *child,
-				  struct obs_source_audio_mix *audio_output,
-				  uint32_t mixers, size_t channels)
+bool hdrp_audio_copy_child(obs_source_t *child, uint64_t *ts_out,
+			   struct obs_source_audio_mix *audio_output,
+			   uint32_t mixers, size_t channels)
 {
 	struct obs_source_audio_mix mix;
+	uint64_t ts;
 	bool any = false;
 
-	UNUSED_PARAMETER(au);
 	if (!child || !audio_output)
+		return false;
+
+	/* pending / zero timestamp == "this source has no audio right now";
+	 * libobs itself skips such sources when a scene mixes its items. */
+	if (obs_source_audio_pending(child))
+		return false;
+
+	ts = obs_source_get_audio_timestamp(child);
+	if (!ts)
 		return false;
 
 	memset(&mix, 0, sizeof(mix));
@@ -293,10 +301,7 @@ bool hdrp_audio_render_from_child(struct hdrp_audio *au, obs_source_t *child,
 		if ((mixers & (1u << i)) == 0)
 			continue;
 		for (size_t ch = 0; ch < channels; ch++) {
-			const float *src =
-				mix.output[i].data[ch < MAX_AUDIO_CHANNELS
-							   ? ch
-							   : 0];
+			const float *src = mix.output[i].data[ch];
 			float *dst = audio_output->output[i].data[ch];
 			if (!dst)
 				continue;
@@ -310,6 +315,9 @@ bool hdrp_audio_render_from_child(struct hdrp_audio *au, obs_source_t *child,
 			}
 		}
 	}
+
+	if (any && ts_out)
+		*ts_out = ts;
 	return any;
 }
 
@@ -381,6 +389,7 @@ void hdrp_audio_attach(struct hdrp_audio *au, obs_source_t *child)
 	au->child = child;
 	au->head = 0;
 	au->count = 0;
+	au->ts_next = 0; /* re-anchor the fallback clock on the new clip */
 	hdrp_mutex_unlock(&au->mtx);
 
 	if (old)
@@ -404,6 +413,7 @@ void hdrp_audio_detach(struct hdrp_audio *au)
 	au->child = NULL;
 	au->count = 0;
 	au->head = 0;
+	au->ts_next = 0;
 	hdrp_mutex_unlock(&au->mtx);
 
 	if (child)
@@ -418,5 +428,6 @@ void hdrp_audio_flush(struct hdrp_audio *au)
 	hdrp_mutex_lock(&au->mtx);
 	au->count = 0;
 	au->head = 0;
+	au->ts_next = 0;
 	hdrp_mutex_unlock(&au->mtx);
 }
