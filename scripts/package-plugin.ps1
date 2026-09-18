@@ -110,8 +110,12 @@ $pkgRoot = Join-Path $stage "HDR-Playlist-Source"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Force -Path "$pkgRoot\bin\64bit" | Out-Null
 New-Item -ItemType Directory -Force -Path "$pkgRoot\data\locale" | Out-Null
+New-Item -ItemType Directory -Force -Path "$pkgRoot\data\effects" | Out-Null
 Copy-Item $dll.FullName "$pkgRoot\bin\64bit\"
 Copy-Item "$root\data\locale\*.ini" "$pkgRoot\data\locale\"
+# The crossfade effect is loaded at runtime via obs_module_file(); without it
+# the switcher silently falls back to hard cuts.
+Copy-Item "$root\data\effects\*.effect" "$pkgRoot\data\effects\"
 Copy-Item "$root\README.md" "$pkgRoot\README.md"
 
 New-Item -ItemType Directory -Force -Path "$root\release" | Out-Null

@@ -46,20 +46,35 @@ static void xfade_free(struct xfade *x);
 
 static bool xfade_load(struct xfade *x)
 {
+	char *error = NULL;
+	char *file;
+
 	memset(x, 0, sizeof(*x));
-	char *file = obs_module_file("effects/crossfade.effect");
-	if (!file)
+	file = obs_module_file("effects/crossfade.effect");
+	if (!file) {
+		blog(LOG_WARNING,
+		     "[HDR-PL] effects/crossfade.effect is missing from the "
+		     "plugin's data directory");
 		return false;
+	}
 	obs_enter_graphics();
-	x->effect = gs_effect_create_from_file(file, NULL);
+	x->effect = gs_effect_create_from_file(file, &error);
 	obs_leave_graphics();
-	bfree(file);
-	if (!x->effect)
+	if (!x->effect) {
+		blog(LOG_WARNING, "[HDR-PL] failed to compile '%s': %s", file,
+		     error ? error : "(no error reported)");
+		bfree(error);
+		bfree(file);
 		return false;
+	}
+	bfree(error);
+	bfree(file);
 	x->tex_a = gs_effect_get_param_by_name(x->effect, "tex_a");
 	x->tex_b = gs_effect_get_param_by_name(x->effect, "tex_b");
 	x->fade = gs_effect_get_param_by_name(x->effect, "fade_val");
 	if (!x->tex_a || !x->tex_b || !x->fade) {
+		blog(LOG_WARNING, "[HDR-PL] crossfade effect is missing one of "
+				  "tex_a/tex_b/fade_val");
 		xfade_free(x);
 		return false;
 	}
@@ -831,6 +846,7 @@ void hdrp_switcher_render(struct hdrp_switcher *sw)
 	uint32_t cw, ch, ow, oh;
 	int tw, th;
 	float scale, ox, oy, is, ix, iy;
+	float os_s, oox, ooy;
 	float t;
 	enum gs_color_space space;
 	enum gs_color_format fmt;
@@ -859,6 +875,13 @@ void hdrp_switcher_render(struct hdrp_switcher *sw)
 	if (!ow || !oh)
 		return;
 
+	if (!cw || !ch) {
+		/* The clip's media has not opened yet, so it reports 0x0.
+		 * Drawing it now would show its first frame at a bogus scale;
+		 * stay empty for the one or two frames this lasts. */
+		return;
+	}
+
 	fit_into(cw, ch, ow, oh, &scale, &ox, &oy);
 
 	if (!sw->xfade_active || sw->xfade_out_idx < 0) {
@@ -867,8 +890,10 @@ void hdrp_switcher_render(struct hdrp_switcher *sw)
 	}
 
 	outgoing = (sw->xfade_out_idx >= 0) ? sw->slot[sw->xfade_out_idx] : NULL;
-	if (!outgoing || outgoing == active) {
+	if (!outgoing || outgoing == active || !obs_source_get_width(outgoing) ||
+	    !obs_source_get_height(outgoing)) {
 		sw->xfade_active = false;
+		sw->xfade_out_idx = -1;
 		render_single(active, scale, ox, oy);
 		return;
 	}
@@ -881,12 +906,21 @@ void hdrp_switcher_render(struct hdrp_switcher *sw)
 	xf_size((int)ow, (int)oh, &tw, &th);
 	xf_texrender_ensure(sw, tw, th, fmt);
 
-	/* Map the output-space fit into intermediate pixels. */
+	/* Map the output-space fit into intermediate pixels, one fit per child:
+	 * the outgoing clip usually has a different resolution than the
+	 * incoming one, and sharing a single fit made the last frame of the
+	 * old clip show up at the wrong scale for the whole fade. */
 	is = scale * ((float)tw / (float)ow);
 	ix = ox * ((float)tw / (float)ow);
 	iy = oy * ((float)th / (float)oh);
 
-	render_child_to_tex(sw, outgoing, tw, th, 0, space, is, ix, iy);
+	fit_into(obs_source_get_width(outgoing), obs_source_get_height(outgoing),
+		 ow, oh, &os_s, &oox, &ooy);
+	os_s *= (float)tw / (float)ow;
+	oox *= (float)tw / (float)ow;
+	ooy *= (float)th / (float)oh;
+
+	render_child_to_tex(sw, outgoing, tw, th, 0, space, os_s, oox, ooy);
 	render_child_to_tex(sw, active, tw, th, 1, space, is, ix, iy);
 
 	if ((sw->xf_tex_valid & 3) != 3) {

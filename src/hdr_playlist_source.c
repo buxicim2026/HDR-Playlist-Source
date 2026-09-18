@@ -538,6 +538,8 @@ static void *hdrp_create(obs_data_t *settings, obs_source_t *source)
 	p->pl = hdrp_playlist_create();
 	p->sw = hdrp_switcher_create(source, p, hdrp_switcher_ended);
 	p->au = hdrp_audio_create();
+	/* The audio module forwards the presented clip's PCM into this source. */
+	hdrp_audio_bind(p->au, source);
 
 	hdrp_mutex_init(&p->mutex);
 
@@ -760,8 +762,9 @@ static void hdrp_video_tick(void *data, float seconds)
 		hdrp_switcher_idle_stop_if_playing(p->sw);
 
 	/* Diagnostics: one line every 5 s. If "pos" stops advancing the decode
-	 * stalled; if "fill" stays at the ring capacity the audio consumer is
-	 * not running; "state" tells whether the media source is playing. */
+	 * stalled; "audio=<n>ch push=<frames>/5s" proves whether the clip's
+	 * audio is actually being forwarded (48 kHz stereo is ~240000 frames
+	 * per 5 s); "state" tells whether the media source is playing. */
 	if (!p->stopped) {
 		p->hb_seconds += seconds;
 		if (p->hb_seconds >= 5.0f) {
@@ -777,11 +780,12 @@ static void hdrp_video_tick(void *data, float seconds)
 				     ? LOG_WARNING
 				     : LOG_INFO,
 			     "[HDR-PL] hb: '%s' state=%d pos=%.1fs dur=%.1fs "
-			     "audio=%uch fill=%zu canvas=%ux%u %s%s",
+			     "audio=%uch push=%llu/5s canvas=%ux%u %s%s",
 			     name ? name : "(none)", (int)st,
 			     (double)pos / 1000.0,
 			     (double)hdrp_switcher_get_duration(p->sw) / 1000.0,
-			     hdrp_audio_channels(p->au), hdrp_audio_fill(p->au),
+			     hdrp_audio_channels(p->au),
+			     (unsigned long long)hdrp_audio_take_frames(p->au),
 			     p->canvas_w, p->canvas_h,
 			     p->output_hdr ? "HDR" : "SDR",
 			     stuck ? " [position not advancing - decode too "
@@ -793,15 +797,24 @@ static void hdrp_video_tick(void *data, float seconds)
 		p->hb_seconds = 0.0f;
 		p->hb_last_pos = 0;
 	}
-
 }
 
 static void hdrp_video_render(void *data, gs_effect_t *effect)
 {
 	struct hdr_playlist *p = data;
 	UNUSED_PARAMETER(effect);
-	if (p)
-		hdrp_switcher_render(p->sw);
+	if (!p)
+		return;
+
+	/* Nothing should be on screen: before the first play, after the
+	 * playlist has finished, or while the source is stopped. Draw nothing
+	 * at all instead of leaving the last decoded frame behind — the media
+	 * children keep their last frame when they stop, and the scene must
+	 * fall back to whatever is underneath. */
+	if (p->stopped)
+		return;
+
+	hdrp_switcher_render(p->sw);
 }
 
 static uint32_t hdrp_get_width(void *data)
@@ -814,39 +827,6 @@ static uint32_t hdrp_get_height(void *data)
 {
 	struct hdr_playlist *p = data;
 	return p ? hdrp_switcher_get_height(p->sw) : 0;
-}
-
-static bool hdrp_source_audio_render(void *data, uint64_t *ts_out,
-				     struct obs_source_audio_mix *audio_output,
-				     uint32_t mixers, size_t channels,
-				     size_t sample_rate)
-{
-	struct hdr_playlist *p = data;
-	obs_source_t *child;
-
-	if (!p || p->stopped)
-		return false;
-
-	/* Primary path: hand the child's own audio mix over to the mixer.
-	 *
-	 * The presented clip is one of our children, and our
-	 * enum_active_sources() puts it in this source's active tree, so libobs
-	 * renders its audio on every audio tick: resampled to the mixer rate,
-	 * buffered with libobs' own timestamp handling, and aligned with every
-	 * other source in the scene. This is byte-for-byte what a scene does
-	 * for each of its items, so our source behaves like a normal media
-	 * source instead of inventing its own clock (which is what silently
-	 * dropped the audio before: a timestamp outside the current mix window
-	 * makes libobs skip the source). */
-	child = hdrp_switcher_active_child(p->sw);
-	if (hdrp_audio_copy_child(child, ts_out, audio_output, mixers, channels))
-		return true;
-
-	/* Fallback: our own ring buffer, fed by the child's capture callback.
-	 * Used while the child has nothing buffered yet (clip start, audio-less
-	 * file, stream reconnect). */
-	return hdrp_audio_render(p->au, ts_out, audio_output, mixers, channels,
-				 sample_rate);
 }
 
 /* libobs requires this for sources that host children: it drives
@@ -1139,7 +1119,6 @@ static const struct obs_source_info hdrp_source_info = {
 	.video_tick = hdrp_video_tick,
 	.video_render = hdrp_video_render,
 	.video_get_color_space = hdrp_video_get_color_space,
-	.audio_render = hdrp_source_audio_render,
 	.enum_active_sources = hdrp_enum_active_sources,
 	.missing_files = hdrp_missing_files,
 	.media_play_pause = hdrp_media_play_pause,

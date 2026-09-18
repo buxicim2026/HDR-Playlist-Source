@@ -1,10 +1,10 @@
 /*
- * audio.c — bounded ring buffer between the child's audio capture callback
- * (decode thread) and the parent's audio_render callback (audio thread).
+ * audio.c — pushes the presented clip's PCM to the parent source with
+ * obs_source_output_audio(), i.e. through libobs' own async-audio pipeline
+ * (buffering, placement, timestamp smoothing and resampling all live there).
  *
- * Overflow policy: drop the oldest samples. That keeps latency bounded and
- * makes it impossible for the buffer to grow without limit if the consumer
- * stalls. Underflow policy: output silence, never block.
+ * The producer is the child's audio capture callback, which libobs invokes on
+ * the child's decode thread with the child's already-prepared PCM.
  */
 
 #include <string.h>
@@ -21,326 +21,99 @@
 #include "audio.h"
 
 #define HDRP_CH_MAX 8
-#define HDRP_RING_MS 500
 
 struct hdrp_audio {
 	hdrp_mutex_t mtx;
 
-	float *buf[HDRP_CH_MAX];
-	size_t cap_frames; /* ring capacity, in frames */
-	size_t head;       /* read position */
-	size_t count;      /* frames currently buffered */
-	uint32_t channels;
-	bool ready; /* buffers allocated & channel count known */
+	obs_source_t *parent; /* source that receives the audio, or NULL */
+	obs_source_t *child;  /* currently captured child, or NULL */
 
-	obs_source_t *child; /* currently captured child, or NULL */
-
-	uint64_t renders;        /* audio_render calls (diagnostics) */
-	bool warned_no_data;
-
-	uint64_t ts_next; /* timestamp we hand back to libobs */
+	uint32_t rate;     /* mixer sample rate we declare to libobs */
+	uint32_t channels; /* child's channel count (diagnostics) */
+	uint64_t frames;   /* frames pushed since the last take (diagnostics) */
+	uint64_t total;    /* frames pushed since the child was attached */
 	bool log_once;
 };
 
-/* ------------------------------------------------------------------ */
-/* ring helpers (caller holds the mutex)                               */
-/* ------------------------------------------------------------------ */
-
-static void ring_write(struct hdrp_audio *au, const float *const *src,
-		       size_t frames)
+static uint32_t mixer_rate(void)
 {
-	const size_t cap = au->cap_frames;
-	size_t w = (au->head + au->count) % cap;
-
-	for (uint32_t c = 0; c < au->channels; c++) {
-		size_t first = frames;
-		if (w + first > cap)
-			first = cap - w;
-		memcpy(au->buf[c] + w, src[c], first * sizeof(float));
-		if (first < frames)
-			memcpy(au->buf[c], src[c] + first,
-			       (frames - first) * sizeof(float));
-	}
-}
-
-static void ring_read(const struct hdrp_audio *au, uint32_t ch, float *dst,
-		      size_t frames)
-{
-	const size_t cap = au->cap_frames;
-	size_t r = au->head;
-	size_t first = frames;
-	if (r + first > cap)
-		first = cap - r;
-	memcpy(dst, au->buf[ch] + r, first * sizeof(float));
-	if (first < frames)
-		memcpy(dst + first, au->buf[ch],
-		       (frames - first) * sizeof(float));
-}
-
-static void ring_free(struct hdrp_audio *au)
-{
-	for (uint32_t c = 0; c < HDRP_CH_MAX; c++) {
-		bfree(au->buf[c]);
-		au->buf[c] = NULL;
-	}
-	au->cap_frames = 0;
-	au->head = 0;
-	au->count = 0;
-	au->ready = false;
-}
-
-static bool ring_alloc(struct hdrp_audio *au, uint32_t channels,
-		       uint32_t sample_rate)
-{
-	size_t cap;
-
-	ring_free(au);
-	if (!channels || !sample_rate)
-		return false;
-
-	cap = (size_t)sample_rate * HDRP_RING_MS / 1000;
-	if (cap < AUDIO_OUTPUT_FRAMES * 4)
-		cap = AUDIO_OUTPUT_FRAMES * 4;
-
-	for (uint32_t c = 0; c < channels; c++) {
-		au->buf[c] = bzalloc(cap * sizeof(float));
-		if (!au->buf[c]) {
-			ring_free(au);
-			return false;
-		}
-	}
-	au->channels = channels;
-	au->cap_frames = cap;
-	au->ready = true;
-	return true;
+	audio_t *audio = obs_get_audio();
+	uint32_t rate = audio ? audio_output_get_sample_rate(audio) : 48000;
+	return rate ? rate : 48000;
 }
 
 /* ------------------------------------------------------------------ */
-/* producer: child audio capture callback                              */
+/* producer: child audio capture callback (decode thread)              */
 /* ------------------------------------------------------------------ */
 
 static void on_audio_capture(void *param, obs_source_t *source,
 			     const struct audio_data *audio, bool muted)
 {
 	struct hdrp_audio *au = param;
-	const float *src[HDRP_CH_MAX];
-	uint32_t channels;
-	uint32_t rate;
-	audio_t *aout;
-	size_t overflow;
+	struct obs_source_audio out;
+	obs_source_t *parent;
+	enum speaker_layout layout;
+	uint32_t channels, rate;
+	bool log_now = false;
+	size_t c;
 
 	if (!au || !audio || !audio->frames || muted)
 		return;
 
-	/* struct audio_data carries no channel count; the child has already
-	 * been resampled to the mixer rate by libobs. */
-	channels = (uint32_t)get_audio_channels(
-		obs_source_get_speaker_layout(source));
-	if (channels == 0 || channels > HDRP_CH_MAX)
-		return;
+	/* struct audio_data carries no layout, so ask the child; media sources
+	 * push at the mixer rate, which is what we declare below. */
+	layout = obs_source_get_speaker_layout(source);
+	channels = (uint32_t)get_audio_channels(layout);
+	if (channels == 0 || channels > HDRP_CH_MAX) {
+		/* Layout not reported (first packets): forward as stereo
+		 * instead of dropping the audio. */
+		layout = SPEAKERS_STEREO;
+		channels = 2;
+	}
 
-	aout = obs_get_audio();
-	rate = aout ? audio_output_get_sample_rate(aout) : 48000;
-	if (!rate)
-		rate = 48000;
-
-	for (uint32_t c = 0; c < channels; c++) {
-		src[c] = (const float *)audio->data[c];
-		if (!src[c])
+	for (c = 0; c < channels; c++) {
+		if (!audio->data[c])
 			return;
 	}
 
 	hdrp_mutex_lock(&au->mtx);
 
-	/* Ignore a callback that raced with a clip switch. */
-	if (au->child != source) {
+	/* Ignore a callback that raced with a clip switch or a bind. */
+	if (au->child != source || !au->parent) {
 		hdrp_mutex_unlock(&au->mtx);
 		return;
 	}
 
-	if (!au->ready || au->channels != channels)
-		ring_alloc(au, channels, rate);
-	if (!au->ready) {
-		hdrp_mutex_unlock(&au->mtx);
-		return;
-	}
-
-	/* Overflow: drop the oldest samples so latency stays bounded. */
-	if (au->count + audio->frames > au->cap_frames) {
-		overflow = au->count + audio->frames - au->cap_frames;
-		au->head = (au->head + overflow) % au->cap_frames;
-		au->count -= overflow;
-	}
-
-	ring_write(au, src, audio->frames);
-	au->count += audio->frames;
-
+	parent = au->parent;
+	rate = au->rate ? au->rate : mixer_rate();
+	au->rate = rate;
+	au->channels = channels;
+	au->frames += audio->frames;
+	au->total += audio->frames;
 	if (!au->log_once) {
 		au->log_once = true;
+		log_now = true;
+	}
+	hdrp_mutex_unlock(&au->mtx);
+
+	memset(&out, 0, sizeof(out));
+	for (c = 0; c < channels; c++)
+		out.data[c] = audio->data[c];
+	out.frames = audio->frames;
+	out.speakers = layout;
+	out.format = AUDIO_FORMAT_FLOAT_PLANAR;
+	out.samples_per_sec = rate;
+	out.timestamp = audio->timestamp;
+
+	/* libobs copies the planes into the parent's audio buffer before this
+	 * returns, so the child's memory is free to go afterwards. */
+	obs_source_output_audio(parent, &out);
+
+	if (log_now)
 		blog(LOG_INFO,
-		     "[HDR-PL] audio forwarding active: %u ch @ %u Hz",
-		     channels, rate);
-	}
-
-	hdrp_mutex_unlock(&au->mtx);
-}
-
-/* ------------------------------------------------------------------ */
-/* consumer: parent source audio_render                                */
-/* ------------------------------------------------------------------ */
-
-bool hdrp_audio_render(struct hdrp_audio *au, uint64_t *ts_out,
-		       struct obs_source_audio_mix *audio_output,
-		       uint32_t mixers, size_t channels, size_t sample_rate)
-{
-	size_t want = AUDIO_OUTPUT_FRAMES;
-	size_t take = 0;
-	uint32_t mix;
-	bool warn_now = false;
-
-	if (!au || !audio_output)
-		return false;
-
-	hdrp_mutex_lock(&au->mtx);
-
-	/* Diagnostic: the mixer has been asking us for audio for a while but
-	 * the media source never delivered any. */
-	if (!au->ready && !au->warned_no_data && ++au->renders > 500) {
-		au->warned_no_data = true;
-		warn_now = true;
-	}
-
-	take = au->count < want ? au->count : want;
-
-	/* Nothing buffered: report "no audio" instead of handing the mixer a
-	 * block of silence stamped with a made-up timestamp. libobs aligns
-	 * sources by that timestamp, so a stale value can shift us out of the
-	 * current mix window (silence) or make the scene compute an out-of-
-	 * range offset. Reporting false makes us behave like a media source
-	 * that simply has not produced anything yet. */
-	if (take == 0) {
-		hdrp_mutex_unlock(&au->mtx);
-		if (warn_now)
-			blog(LOG_WARNING,
-			     "[HDR-PL] the media source has not delivered any "
-			     "audio yet - check that the file has an audio "
-			     "track and is not muted in the mixer");
-		return false;
-	}
-
-	for (mix = 0; mix < MAX_AUDIO_MIXES; mix++) {
-		size_t ch;
-		if ((mixers & (1u << mix)) == 0)
-			continue;
-		for (ch = 0; ch < channels; ch++) {
-			float *dst = audio_output->output[mix].data[ch];
-			uint32_t srcch;
-			if (!dst)
-				continue;
-			srcch = ch < au->channels ? (uint32_t)ch
-						  : au->channels - 1;
-			ring_read(au, srcch, dst, take);
-			if (take < want)
-				memset(dst + take, 0,
-				       (want - take) * sizeof(float));
-		}
-	}
-
-	if (ts_out) {
-		/* Continuous playback clock: this block starts where the
-		 * previous one ended. */
-		if (!au->ts_next)
-			au->ts_next = os_gettime_ns();
-		*ts_out = au->ts_next;
-		au->ts_next += (uint64_t)((take * 1000000000ULL) /
-					  (sample_rate ? sample_rate : 48000));
-	}
-
-	au->head = (au->head + take) % au->cap_frames;
-	au->count -= take;
-	hdrp_mutex_unlock(&au->mtx);
-
-	return true;
-}
-
-bool hdrp_audio_capture_active(struct hdrp_audio *au)
-{
-	bool r;
-	if (!au)
-		return false;
-	hdrp_mutex_lock(&au->mtx);
-	r = au->ready;
-	hdrp_mutex_unlock(&au->mtx);
-	return r;
-}
-
-bool hdrp_audio_copy_child(obs_source_t *child, uint64_t *ts_out,
-			   struct obs_source_audio_mix *audio_output,
-			   uint32_t mixers, size_t channels)
-{
-	struct obs_source_audio_mix mix;
-	uint64_t ts;
-	bool any = false;
-
-	if (!child || !audio_output)
-		return false;
-
-	/* pending / zero timestamp == "this source has no audio right now";
-	 * libobs itself skips such sources when a scene mixes its items. */
-	if (obs_source_audio_pending(child))
-		return false;
-
-	ts = obs_source_get_audio_timestamp(child);
-	if (!ts)
-		return false;
-
-	memset(&mix, 0, sizeof(mix));
-	obs_source_get_audio_mix(child, &mix);
-
-	for (uint32_t i = 0; i < MAX_AUDIO_MIXES; i++) {
-		if ((mixers & (1u << i)) == 0)
-			continue;
-		for (size_t ch = 0; ch < channels; ch++) {
-			const float *src = mix.output[i].data[ch];
-			float *dst = audio_output->output[i].data[ch];
-			if (!dst)
-				continue;
-			if (src) {
-				memcpy(dst, src,
-				       AUDIO_OUTPUT_FRAMES * sizeof(float));
-				any = true;
-			} else {
-				memset(dst, 0,
-				       AUDIO_OUTPUT_FRAMES * sizeof(float));
-			}
-		}
-	}
-
-	if (any && ts_out)
-		*ts_out = ts;
-	return any;
-}
-
-size_t hdrp_audio_fill(struct hdrp_audio *au)
-{
-	size_t n;
-	if (!au)
-		return 0;
-	hdrp_mutex_lock(&au->mtx);
-	n = au->count;
-	hdrp_mutex_unlock(&au->mtx);
-	return n;
-}
-
-uint32_t hdrp_audio_channels(struct hdrp_audio *au)
-{
-	uint32_t c;
-	if (!au)
-		return 0;
-	hdrp_mutex_lock(&au->mtx);
-	c = au->ready ? au->channels : 0;
-	hdrp_mutex_unlock(&au->mtx);
-	return c;
+		     "[HDR-PL] audio forwarding active: %u ch @ %u Hz from '%s'",
+		     (unsigned)channels, (unsigned)rate,
+		     obs_source_get_name(source));
 }
 
 /* ------------------------------------------------------------------ */
@@ -351,20 +124,17 @@ struct hdrp_audio *hdrp_audio_create(void)
 {
 	struct hdrp_audio *au = bzalloc(sizeof(*au));
 	hdrp_mutex_init(&au->mtx);
-	au->ts_next = 0;
 	return au;
 }
 
-void hdrp_audio_destroy(struct hdrp_audio *au)
+void hdrp_audio_bind(struct hdrp_audio *au, obs_source_t *parent)
 {
 	if (!au)
 		return;
-	hdrp_audio_detach(au);
 	hdrp_mutex_lock(&au->mtx);
-	ring_free(au);
+	au->parent = parent;
+	au->rate = mixer_rate();
 	hdrp_mutex_unlock(&au->mtx);
-	hdrp_mutex_destroy(&au->mtx);
-	bfree(au);
 }
 
 void hdrp_audio_attach(struct hdrp_audio *au, obs_source_t *child)
@@ -375,11 +145,11 @@ void hdrp_audio_attach(struct hdrp_audio *au, obs_source_t *child)
 		return;
 
 	/* Swap the target under our lock, but NEVER call into libobs while
-	 * holding it. The capture callback runs with the child's
+	 * holding it: the capture callback runs with the child's
 	 * audio_cb_mutex held and takes this same lock, so registering from
 	 * inside the critical section is a classic AB-BA deadlock that wedges
-	 * the OBS audio thread — the symptom is total silence while video
-	 * keeps playing. */
+	 * the OBS audio thread (the symptom is total silence while video keeps
+	 * playing). */
 	hdrp_mutex_lock(&au->mtx);
 	if (au->child == child) {
 		hdrp_mutex_unlock(&au->mtx);
@@ -387,9 +157,11 @@ void hdrp_audio_attach(struct hdrp_audio *au, obs_source_t *child)
 	}
 	old = au->child;
 	au->child = child;
-	au->head = 0;
-	au->count = 0;
-	au->ts_next = 0; /* re-anchor the fallback clock on the new clip */
+	au->rate = mixer_rate();
+	au->channels = 0;
+	au->frames = 0;
+	au->total = 0;
+	au->log_once = false;
 	hdrp_mutex_unlock(&au->mtx);
 
 	if (old)
@@ -411,9 +183,8 @@ void hdrp_audio_detach(struct hdrp_audio *au)
 	hdrp_mutex_lock(&au->mtx);
 	child = au->child;
 	au->child = NULL;
-	au->count = 0;
-	au->head = 0;
-	au->ts_next = 0;
+	au->channels = 0;
+	au->frames = 0;
 	hdrp_mutex_unlock(&au->mtx);
 
 	if (child)
@@ -426,8 +197,43 @@ void hdrp_audio_flush(struct hdrp_audio *au)
 	if (!au)
 		return;
 	hdrp_mutex_lock(&au->mtx);
-	au->count = 0;
-	au->head = 0;
-	au->ts_next = 0;
+	au->frames = 0;
+	au->channels = 0;
 	hdrp_mutex_unlock(&au->mtx);
+}
+
+void hdrp_audio_destroy(struct hdrp_audio *au)
+{
+	if (!au)
+		return;
+	hdrp_audio_detach(au);
+	hdrp_mutex_destroy(&au->mtx);
+	bfree(au);
+}
+
+/* Frames pushed since the previous call (the diagnostics heartbeat uses this
+ * to show whether the child is producing audio at all). */
+uint64_t hdrp_audio_take_frames(struct hdrp_audio *au)
+{
+	uint64_t n;
+
+	if (!au)
+		return 0;
+	hdrp_mutex_lock(&au->mtx);
+	n = au->frames;
+	au->frames = 0;
+	hdrp_mutex_unlock(&au->mtx);
+	return n;
+}
+
+uint32_t hdrp_audio_channels(struct hdrp_audio *au)
+{
+	uint32_t c;
+
+	if (!au)
+		return 0;
+	hdrp_mutex_lock(&au->mtx);
+	c = au->channels;
+	hdrp_mutex_unlock(&au->mtx);
+	return c;
 }

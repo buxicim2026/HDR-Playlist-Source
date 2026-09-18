@@ -73,9 +73,11 @@ if [ "$OS" = "linux" ]; then
     stage="$workdir/stage-linux"
     rm -rf "$stage"
     mkdir -p "$stage/HDR-Playlist-Source/bin/64bit" \
-             "$stage/HDR-Playlist-Source/data/locale"
+             "$stage/HDR-Playlist-Source/data/locale" \
+             "$stage/HDR-Playlist-Source/data/effects"
     cp "$so" "$stage/HDR-Playlist-Source/bin/64bit/"
     cp "$root"/data/locale/*.ini "$stage/HDR-Playlist-Source/data/locale/"
+    cp "$root"/data/effects/*.effect "$stage/HDR-Playlist-Source/data/effects/"
     cp "$root/README.md" "$stage/HDR-Playlist-Source/"
 
     mkdir -p "$root/release"
@@ -96,10 +98,12 @@ else
     rm -rf "$stage"
     bundle="$stage/HDR-Playlist-Source.plugin"
     mkdir -p "$bundle/Contents/MacOS" \
-             "$bundle/Contents/Resources/data/locale"
+             "$bundle/Contents/Resources/data/locale" \
+             "$bundle/Contents/Resources/data/effects"
     cp "$mod" "$bundle/Contents/MacOS/HDR-Playlist-Source"
     chmod +x "$bundle/Contents/MacOS/HDR-Playlist-Source"
     cp "$root"/data/locale/*.ini "$bundle/Contents/Resources/data/locale/"
+    cp "$root"/data/effects/*.effect "$bundle/Contents/Resources/data/effects/"
     cp "$root/README.md" "$bundle/Contents/Resources/"
     cat > "$bundle/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

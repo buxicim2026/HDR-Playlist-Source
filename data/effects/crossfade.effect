@@ -25,47 +25,21 @@ VertData VSDefault(VertData v_in) {
 	return vert_out;
 }
 
-float srgb_nonlinear_to_linear_channel(float u) {
-	return (u <= 0.04045) ? (u / 12.92) : pow((u + 0.055) / 1.055, 2.4);
-}
-
-float3 srgb_nonlinear_to_linear(float3 v) {
-	return float3(srgb_nonlinear_to_linear_channel(v.r),
-		srgb_nonlinear_to_linear_channel(v.g),
-		srgb_nonlinear_to_linear_channel(v.b));
-}
-
-float4 Crossfade(FragData f_in) {
-	float4 a_val = tex_a.Sample(textureSampler, f_in.uv);
-	float4 b_val = tex_b.Sample(textureSampler, f_in.uv);
-	float4 rgba = lerp(a_val, b_val, fade_val);
-	return rgba;
-}
-
+/* Plain lerp, exactly like OBS's own fade transition: the sRGB handling is
+ * done by the sampler/framebuffer state set up around the draw
+ * (gs_effect_set_texture_srgb + gs_enable_framebuffer_srgb), so the shader
+ * must stay trivial. Anything fancy here (ternary expressions, helper
+ * functions returning float3, pow) risks the effect failing to compile, and a
+ * failing effect means the playlist silently degrades to hard cuts. */
 float4 PSCrossfade(FragData f_in) : TARGET {
-	float4 rgba = Crossfade(f_in);
-	rgba.rgb = srgb_nonlinear_to_linear(rgba.rgb);
-	return rgba;
-}
-
-/* Linear variant used on HDR canvases: the intermediate is a 16F texture in
- * 709-extended space, so the sampled values are already in a linear-ish
- * encoding and must NOT be gamma-decoded again. OBS's own fade transition
- * does exactly this (technique "FadeLinear" + gs_effect_set_texture_srgb). */
-float4 PSCrossfadeLinear(FragData f_in) : TARGET {
 	float4 a_val = tex_a.Sample(textureSampler, f_in.uv);
 	float4 b_val = tex_b.Sample(textureSampler, f_in.uv);
 	return lerp(a_val, b_val, fade_val);
 }
 
-float4 CrossfadeSingle(FragData f_in) {
-	float4 a_val = tex_a.Sample(textureSampler, f_in.uv);
-	float4 rgba = a_val * fade_val;
-	return rgba;
-}
-
 float4 PSCrossfadeSingle(FragData f_in) : TARGET {
-	return CrossfadeSingle(f_in);
+	float4 a_val = tex_a.Sample(textureSampler, f_in.uv);
+	return a_val * fade_val;
 }
 
 technique Fade {
@@ -75,10 +49,11 @@ technique Fade {
 	}
 }
 
+/* Kept as a separate technique so the HDR path keeps working unchanged. */
 technique FadeLinear {
 	pass {
 		vertex_shader = VSDefault(v_in);
-		pixel_shader = PSCrossfadeLinear(f_in);
+		pixel_shader = PSCrossfade(f_in);
 	}
 }
 
