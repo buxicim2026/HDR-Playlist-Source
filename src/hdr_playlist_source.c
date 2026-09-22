@@ -44,6 +44,11 @@
 #define KEY_DEINTERLACE    "deinterlace"
 #define KEY_ADD_FOLDER     "hdrp_add_folder"
 
+/* Low-memory mode closes the decoders (and their frame caches) after this many
+ * seconds without playback. The grace period keeps fast scene switching from
+ * re-opening the file on every toggle. */
+#define HDRP_IDLE_UNLOAD_SECONDS 20.0f
+
 enum {
 	VIS_STOP_RESTART = 0,
 	VIS_PAUSE_RESUME,
@@ -94,7 +99,10 @@ struct hdr_playlist {
 	bool need_preload_retry;
 	float hb_seconds;    /* diagnostics heartbeat */
 	int64_t hb_last_pos; /* position at the previous heartbeat (ms) */
-	bool info_logged;    /* media info for the current clip logged */
+	float info_check_seconds; /* throttles the media info check */
+	char info_cache[192];     /* last media info we showed/logged */
+	float idle_seconds;       /* how long playback has been stopped */
+	bool decoders_closed;     /* idle decoders already released */
 };
 
 /* ------------------------------------------------------------------ */
@@ -184,7 +192,8 @@ static void hdrp_build_info_media(struct hdr_playlist *p, char *buf,
 	const char *csname;
 
 	if (!p || p->stopped || !hdrp_switcher_active_path(p->sw)) {
-		snprintf(buf, size, "%s", obs_module_text("InfoIdle"));
+		snprintf(buf, size, "%s%s", obs_module_text("InfoMedia"),
+			 obs_module_text("InfoIdle"));
 		return;
 	}
 
@@ -195,8 +204,9 @@ static void hdrp_build_info_media(struct hdr_playlist *p, char *buf,
 	csname = hdrp_space_name(cs, &hdr);
 	hdrp_switcher_get_media_size(p->sw, &mw, &mh);
 
-	snprintf(buf, size, "%ux%u · %s · %s · audio %uch · deint %s", mw, mh,
-		 csname, hdr ? "HDR" : "SDR", hdrp_audio_channels(p->au),
+	snprintf(buf, size, "%s%ux%u · %s · %s · audio %uch · deint %s",
+		 obs_module_text("InfoMedia"), mw, mh, csname,
+		 hdr ? "HDR" : "SDR", hdrp_audio_channels(p->au),
 		 hdrp_deint_name(p->deinterlace_mode));
 }
 
@@ -215,8 +225,9 @@ static void hdrp_build_info_output(struct hdr_playlist *p, char *buf,
 	if (ovi.fps_den)
 		fps = ovi.fps_num / ovi.fps_den;
 
-	snprintf(buf, size, "%ux%u @ %ufps · %s · %s", ovi.base_width,
-		 ovi.base_height, fps, hdrp_output_space_name(ovi.colorspace),
+	snprintf(buf, size, "%s%ux%u @ %ufps · %s · %s",
+		 obs_module_text("InfoOutput"), ovi.base_width, ovi.base_height,
+		 fps, hdrp_output_space_name(ovi.colorspace),
 		 (p && p->output_hdr) ? "HDR session" : "SDR session");
 }
 
@@ -469,7 +480,6 @@ static void hdrp_start_current(struct hdr_playlist *p)
 
 	p->stopped = false;
 	p->hb_seconds = 0.0f;
-	p->info_logged = false;
 	hdrp_switcher_play(p->sw, path, &opts);
 	if (p->au)
 		hdrp_attach_audio_to_active(p);
@@ -549,7 +559,6 @@ static void hdrp_switcher_ended(void *opaque)
 	hdrp_attach_audio_to_active(p);
 	obs_source_media_started(p->source);
 	p->need_preload_retry = true;
-	p->info_logged = false;
 	hdrp_queue_props_refresh(p);
 }
 
@@ -581,7 +590,6 @@ static void hdrp_jump(struct hdr_playlist *p, bool forward)
 	hdrp_switcher_play(p->sw, target, &opts);
 	hdrp_attach_audio_to_active(p);
 	p->need_preload_retry = true;
-	p->info_logged = false;
 	hdrp_queue_props_refresh(p);
 }
 
@@ -948,16 +956,37 @@ static void hdrp_video_tick(void *data, float seconds)
 		p->hb_last_pos = 0;
 	}
 
-	/* Log the clip's media info once per clip, as soon as the media source
-	 * reports a frame size (right after a start it is still 0x0). */
-	if (!p->stopped && !p->info_logged) {
-		uint32_t mw = 0, mh = 0;
+	/* Low-memory mode: once playback has been stopped for a while, close the
+	 * decoders so an idle source (hidden, or a finished playlist) does not
+	 * keep the demuxer/codec/frame caches of a 4K HDR file around. The next
+	 * play re-opens the file. */
+	if (p->stopped) {
+		p->idle_seconds += seconds;
+		if (p->low_memory && !p->decoders_closed &&
+		    p->idle_seconds >= HDRP_IDLE_UNLOAD_SECONDS) {
+			p->decoders_closed = true;
+			hdrp_switcher_unload(p->sw);
+		}
+	} else {
+		p->idle_seconds = 0.0f;
+		p->decoders_closed = false;
+	}
 
-		hdrp_switcher_get_media_size(p->sw, &mw, &mh);
-		if (mw && mh) {
-			char info[256];
-			p->info_logged = true;
-			hdrp_build_info_media(p, info, sizeof(info));
+	/* Media info: the decoder only knows a clip's resolution / colour space
+	 * *after* it opened the file, and it can change mid-clip (audio track
+	 * appears, stream reconnects). Poll the info twice per second and refresh
+	 * the properties panel only when it actually changed — event driven,
+	 * never a per-second panel rebuild. */
+	p->info_check_seconds += seconds;
+	if (p->info_check_seconds >= 0.5f) {
+		char info[192];
+
+		p->info_check_seconds = 0.0f;
+		hdrp_build_info_media(p, info, sizeof(info));
+		if (strcmp(info, p->info_cache) != 0) {
+			snprintf(p->info_cache, sizeof(p->info_cache), "%s",
+				 info);
+			hdrp_queue_props_refresh(p);
 			blog(LOG_INFO, "[HDR-PL] media: %s", info);
 		}
 	}
@@ -1266,11 +1295,12 @@ static obs_properties_t *hdrp_properties(void *data)
 	obs_property_list_add_int(mixed, obs_module_text("MixedForceSDR"),
 				  MIXED_FORCE_SDR);
 
-	/* Credit + donation button (opens the shop page in the browser). */
-	obs_properties_add_text(props, "hdrp_credit",
-				obs_module_text("Credit"), OBS_TEXT_INFO);
+	/* Credit + support on one row. OBS's property API has no horizontal
+	 * container (a text property and a button always stack vertically), so
+	 * the credit text is part of the button's label: the whole row is the
+	 * clickable "support us" control. */
 	obs_properties_add_button(props, "hdrp_support",
-				  obs_module_text("SupportUs"),
+				  obs_module_text("CreditLine"),
 				  hdrp_support_clicked);
 
 	return props;

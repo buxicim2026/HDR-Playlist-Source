@@ -477,6 +477,34 @@ void hdrp_switcher_stop(struct hdrp_switcher *sw)
 	sw->active_path = NULL;
 }
 
+void hdrp_switcher_unload(struct hdrp_switcher *sw)
+{
+	if (!sw)
+		return;
+
+	hdrp_switcher_stop(sw);
+
+	/* Close the file instead of destroying the source object: what actually
+	 * holds the memory is the media-playback object (demuxer, codec contexts
+	 * and the decoded frame cache), and clearing "local_file" makes libobs
+	 * free it. obs_source_update() is deferred by libobs to the next tick,
+	 * so this stays safe no matter which thread calls us — destroying the
+	 * source here would mutate obs->data.sources while it is being ticked. */
+	for (int i = 0; i < 2; i++) {
+		obs_data_t *s;
+
+		if (!sw->slot[i])
+			continue;
+		s = obs_source_get_settings(sw->slot[i]);
+		if (!s)
+			continue;
+		make_base_settings(s);
+		obs_source_update(sw->slot[i], s);
+		obs_data_release(s);
+	}
+	blog(LOG_INFO, "[HDR-PL] closed the decoders while idle (low-memory)");
+}
+
 void hdrp_switcher_set_paused(struct hdrp_switcher *sw, bool pause)
 {
 	if (!sw || sw->active_idx < 0)

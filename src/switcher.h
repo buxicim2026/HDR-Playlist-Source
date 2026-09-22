@@ -104,6 +104,11 @@ void hdrp_switcher_set_transition_ms(struct hdrp_switcher *sw, int ms);
 /* Release the idle decoder (low-memory mode). */
 void hdrp_switcher_idle_stop_if_playing(struct hdrp_switcher *sw);
 
+/* Stop everything and destroy both decoders (frame caches included) while
+ * nothing is playing. Used when playback stops in low-memory mode; the next
+ * play() re-creates the slot transparently. */
+void hdrp_switcher_unload(struct hdrp_switcher *sw);
+
 /* Canvas adaptation: when adaptive is true the source reports (and renders
  * at) the OBS base canvas size, fitting the video inside it. This keeps the
  * compositor 1:1 and avoids an extra full-resolution scaling/conversion
