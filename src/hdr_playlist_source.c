@@ -460,13 +460,24 @@ static void hdrp_attach_audio_to_active(struct hdr_playlist *p)
 
 static void hdrp_start_current(struct hdr_playlist *p)
 {
-	const char *path = hdrp_playlist_current(p->pl);
+	char *path = NULL;
 	struct hdrp_switcher_opts opts;
 
-	if (!path && hdrp_playlist_count(p->pl) > 0) {
-		hdrp_playlist_set_current(p->pl, 0);
-		path = hdrp_playlist_current(p->pl);
+	/* Copy the path while holding the lock: applying settings rebuilds the
+	 * list on the UI thread and frees the very strings the playlist hands
+	 * out, so the playlist must never be dereferenced outside the lock. */
+	hdrp_mutex_lock(&p->mutex);
+	if (hdrp_playlist_count(p->pl) > 0) {
+		const char *cur = hdrp_playlist_current(p->pl);
+
+		if (!cur) {
+			hdrp_playlist_set_current(p->pl, 0);
+			cur = hdrp_playlist_current(p->pl);
+		}
+		if (cur)
+			path = bstrdup(cur);
 	}
+	hdrp_mutex_unlock(&p->mutex);
 	if (!path)
 		return;
 
@@ -481,6 +492,7 @@ static void hdrp_start_current(struct hdr_playlist *p)
 	p->stopped = false;
 	p->hb_seconds = 0.0f;
 	hdrp_switcher_play(p->sw, path, &opts);
+	bfree(path);
 	if (p->au)
 		hdrp_attach_audio_to_active(p);
 
@@ -514,41 +526,47 @@ static void hdrp_finish_at_end(struct hdr_playlist *p)
 
 static void hdrp_try_preload_next(struct hdr_playlist *p)
 {
-	const char *next;
+	char *next = NULL;
 	struct hdrp_switcher_opts opts;
 
-	if (p->low_memory || hdrp_playlist_count(p->pl) == 0)
-		return;
-	if (hdrp_switcher_is_transitioning(p->sw))
+	if (p->low_memory || hdrp_switcher_is_transitioning(p->sw))
 		return;
 
-	next = hdrp_playlist_peek_next(p->pl);
+	hdrp_mutex_lock(&p->mutex);
+	if (hdrp_playlist_count(p->pl) > 0) {
+		const char *n = hdrp_playlist_peek_next(p->pl);
+
+		if (n)
+			next = bstrdup(n);
+	}
+	hdrp_mutex_unlock(&p->mutex);
 	if (!next)
 		return;
 
 	hdrp_apply_opts(p, &opts);
 	if (!hdrp_switcher_preload(p->sw, next, &opts))
 		p->need_preload_retry = true;
+	bfree(next);
 }
 
 /* Switcher asked us to move on: the active clip ended with nothing parked. */
 static void hdrp_switcher_ended(void *opaque)
 {
 	struct hdr_playlist *p = opaque;
-	const char *path;
+	char *path = NULL;
 	struct hdrp_switcher_opts opts;
 
 	if (!p || p->stopped)
 		return;
 
-	path = hdrp_playlist_peek_next(p->pl);
-	if (!path) {
-		hdrp_finish_at_end(p);
-		return;
+	hdrp_mutex_lock(&p->mutex);
+	if (hdrp_playlist_peek_next(p->pl)) {
+		hdrp_playlist_next(p->pl);
+		if (hdrp_playlist_current(p->pl))
+			path = bstrdup(hdrp_playlist_current(p->pl));
 	}
+	hdrp_mutex_unlock(&p->mutex);
 
-	hdrp_playlist_next(p->pl);
-	path = hdrp_playlist_current(p->pl);
 	if (!path) {
 		hdrp_finish_at_end(p);
 		return;
@@ -556,6 +574,7 @@ static void hdrp_switcher_ended(void *opaque)
 
 	hdrp_apply_opts(p, &opts);
 	hdrp_switcher_play(p->sw, path, &opts);
+	bfree(path);
 	hdrp_attach_audio_to_active(p);
 	obs_source_media_started(p->source);
 	p->need_preload_retry = true;
@@ -564,23 +583,26 @@ static void hdrp_switcher_ended(void *opaque)
 
 static void hdrp_jump(struct hdr_playlist *p, bool forward)
 {
-	const char *target;
+	char *target = NULL;
 	struct hdrp_switcher_opts opts;
 
-	if (hdrp_playlist_count(p->pl) == 0)
-		return;
-	if (hdrp_playlist_count(p->pl) > 1) {
-		const char *t = forward ? hdrp_playlist_next(p->pl)
-					: hdrp_playlist_previous(p->pl);
-		if (!t && forward)
-			hdrp_playlist_set_current(p->pl, 0);
+	hdrp_mutex_lock(&p->mutex);
+	if (hdrp_playlist_count(p->pl) > 0) {
+		if (hdrp_playlist_count(p->pl) > 1) {
+			const char *t = forward ? hdrp_playlist_next(p->pl)
+						: hdrp_playlist_previous(p->pl);
+			if (!t && forward)
+				hdrp_playlist_set_current(p->pl, 0);
+		}
+		if (hdrp_playlist_current(p->pl))
+			target = bstrdup(hdrp_playlist_current(p->pl));
 	}
-
-	target = hdrp_playlist_current(p->pl);
+	hdrp_mutex_unlock(&p->mutex);
 	if (!target)
 		return;
 
 	if (p->stopped) {
+		bfree(target);
 		hdrp_start_current(p);
 		return;
 	}
@@ -588,6 +610,7 @@ static void hdrp_jump(struct hdr_playlist *p, bool forward)
 	hdrp_apply_opts(p, &opts);
 	hdrp_switcher_drop_preload(p->sw);
 	hdrp_switcher_play(p->sw, target, &opts);
+	bfree(target);
 	hdrp_attach_audio_to_active(p);
 	p->need_preload_retry = true;
 	hdrp_queue_props_refresh(p);
@@ -597,8 +620,15 @@ static void hdrp_jump(struct hdr_playlist *p, bool forward)
 static void hdrp_playlist_changed(struct hdr_playlist *p)
 {
 	const char *playing = hdrp_switcher_active_path(p->sw);
+	bool still_listed = false;
 
-	if (!p->stopped && playing && cursor_to_path(p, playing) != SIZE_MAX) {
+	if (!p->stopped && playing) {
+		hdrp_mutex_lock(&p->mutex);
+		still_listed = cursor_to_path(p, playing) != SIZE_MAX;
+		hdrp_mutex_unlock(&p->mutex);
+	}
+
+	if (still_listed) {
 		/* The running clip survived the edit: keep it, but re-arm the
 		 * preload so "next" follows the new order. */
 		blog(LOG_INFO, "[HDR-PL] playlist updated; current clip kept");
@@ -907,8 +937,22 @@ static void hdrp_video_tick(void *data, float seconds)
 	hdrp_sync_output_config(p);
 	hdrp_switcher_tick(p->sw, seconds);
 
-	if (hdrp_switcher_consume_promote_event(p->sw))
+	if (hdrp_switcher_consume_promote_event(p->sw)) {
+		/* The switcher promoted the parked clip. The playlist cursor is
+		 * only *peeked* at when preloading, so point it at whatever
+		 * actually plays now — otherwise "next" and the follow-up
+		 * preload keep working from a stale position and gapless mode
+		 * ends up replaying clips. */
+		const char *playing = hdrp_switcher_active_path(p->sw);
+
+		if (playing) {
+			hdrp_mutex_lock(&p->mutex);
+			cursor_to_path(p, playing);
+			hdrp_mutex_unlock(&p->mutex);
+		}
 		hdrp_attach_audio_to_active(p);
+		p->need_preload_retry = true;
+	}
 
 	if (p->need_preload_retry && !p->low_memory && !p->stopped &&
 	    !hdrp_switcher_is_transitioning(p->sw)) {

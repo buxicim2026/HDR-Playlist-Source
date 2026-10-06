@@ -97,8 +97,14 @@ static void on_audio_capture(void *param, obs_source_t *source,
 	hdrp_mutex_unlock(&au->mtx);
 
 	memset(&out, 0, sizeof(out));
-	for (c = 0; c < channels; c++)
-		out.data[c] = audio->data[c];
+	/* libobs copies the planes with the *mixer's* channel count (see
+	 * source_output_audio_push_back()), so every plane up to
+	 * MAX_AUDIO_CHANNELS must be a valid pointer — a mono track would
+	 * otherwise make libobs memcpy from NULL. Duplicate the last real plane
+	 * for the extra channels; `speakers` still describes the real layout, so
+	 * libobs' resampler interprets them correctly. */
+	for (c = 0; c < HDRP_CH_MAX && c < MAX_AUDIO_CHANNELS; c++)
+		out.data[c] = audio->data[c < channels ? c : channels - 1];
 	out.frames = audio->frames;
 	out.speakers = layout;
 	out.format = AUDIO_FORMAT_FLOAT_PLANAR;
