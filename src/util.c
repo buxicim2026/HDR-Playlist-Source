@@ -78,7 +78,9 @@ void hdrp_mutex_unlock(hdrp_mutex_t *m)
 /* Opens `url` in the user's default browser. */
 void hdrp_open_url(const char *url)
 {
-	char cmd[768];
+#ifndef _WIN32
+	char cmd[768]; /* only the POSIX branches use a shell command */
+#endif
 
 	if (!url || !*url)
 		return;

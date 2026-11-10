@@ -56,7 +56,9 @@ jobs:
 
   macos-arm64:
     name: macOS arm64
-    runs-on: macos-14
+    # macos-14 resolves to a retired runner configuration; keep the hosted
+    # arm64 label current so the three-platform release can be produced.
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - name: Cache OBS SDK

@@ -24,7 +24,6 @@
 #include <graphics/graphics.h>
 #include <graphics/vec4.h>
 #include <util/bmem.h>
-#include <util/threading.h>
 
 #include "playlist.h"
 #include "switcher.h"
@@ -139,11 +138,10 @@ struct hdrp_switcher {
 	int preload_ticks;    /* watchdog against a preload that never parks */
 
 	/* Written by the media_ended signal (media thread) with
-	 * os_atomic_set_long(), consumed by the video thread. A plain bool or
-	 * volatile is a data race in C; libobs' atomics also give us the
-	 * necessary memory barriers. This is the ONLY field the media thread
-	 * is allowed to touch. */
-	volatile long end_requested;
+	 * HDRP_ATOMIC_SET(), consumed by the video thread. A plain bool or
+	 * volatile is a data race in C; atomics also provide the memory
+	 * barriers. This is the ONLY field the media thread may touch. */
+	hdrp_atomic_t end_requested;
 	bool promote_event;
 
 	/* crossfade */
@@ -332,7 +330,7 @@ static void on_media_ended(void *data, calldata_t *cd)
 	 * thread. play()/stop()/promote() clear the flag, so a late signal
 	 * from a clip that is no longer current is discarded as before. */
 	if (sw)
-		os_atomic_set_long(&sw->end_requested, 1);
+		HDRP_ATOMIC_SET(&sw->end_requested, 1);
 }
 
 static void slot_update_settings(obs_source_t *child, const char *path,
@@ -391,7 +389,7 @@ hdrp_switcher_create(obs_source_t *parent, void *opaque,
 {
 	struct hdrp_switcher *sw = bzalloc(sizeof(*sw));
 	hdrp_mutex_init(&sw->mtx);
-	os_atomic_set_long(&sw->end_requested, 0);
+	HDRP_ATOMIC_SET(&sw->end_requested, 0);
 	sw->parent = parent;
 	sw->opaque = opaque;
 	sw->ended_cb = cb;
@@ -521,7 +519,7 @@ bool hdrp_switcher_play(struct hdrp_switcher *sw, const char *path,
 	hdrp_mutex_unlock(&sw->mtx);
 
 	clear_preload(sw);
-	os_atomic_set_long(&sw->end_requested, 0);
+	HDRP_ATOMIC_SET(&sw->end_requested, 0);
 	sw->xfade_active = false;
 	sw->xfade_out_idx = -1;
 	return true;
@@ -584,7 +582,7 @@ void hdrp_switcher_stop(struct hdrp_switcher *sw)
 	}
 	clear_preload(sw);
 	sw->active_idx = -1;
-	os_atomic_set_long(&sw->end_requested, 0);
+	HDRP_ATOMIC_SET(&sw->end_requested, 0);
 	sw->xfade_active = false;
 	sw->xfade_out_idx = -1;
 	hdrp_mutex_lock(&sw->mtx);
@@ -823,7 +821,7 @@ static void promote(struct hdrp_switcher *sw)
 	sw->park_sent = false;
 	sw->preload_ticks = 0;
 	hdrp_mutex_unlock(&sw->mtx);
-	os_atomic_set_long(&sw->end_requested, 0);
+	HDRP_ATOMIC_SET(&sw->end_requested, 0);
 
 	if (do_xf) {
 		sw->xfade_active = true;
@@ -900,9 +898,9 @@ void hdrp_switcher_tick(struct hdrp_switcher *sw, float seconds)
 	}
 
 	/* --- 2. react to the end of the active clip --- */
-	/* os_atomic_set_long() returns the previous value, so this is an atomic
+	/* HDRP_ATOMIC_SET() returns the previous value, so this is an atomic
 	 * test-and-clear. No torn read / lost wakeup against the media thread. */
-	if (os_atomic_set_long(&sw->end_requested, 0)) {
+	if (HDRP_ATOMIC_SET(&sw->end_requested, 0)) {
 		if (sw->preload_ready) {
 			promote(sw);
 		} else if (sw->ended_cb && sw->opaque) {

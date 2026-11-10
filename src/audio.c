@@ -30,7 +30,6 @@
 #include <media-io/audio-io.h>
 #include <util/bmem.h>
 #include <util/platform.h>
-#include <util/threading.h>
 
 #include "audio.h"
 
@@ -40,8 +39,8 @@ struct hdrp_audio {
 	hdrp_mutex_t mtx;     /* child, parent_weak, counters */
 	hdrp_mutex_t reg_mtx; /* serialises attach/detach sequences */
 
-	volatile long refs;
-	volatile long dying;
+	hdrp_atomic_t refs;
+	hdrp_atomic_t dying;
 
 	obs_weak_source_t *parent_weak; /* source that receives the audio */
 	obs_source_t *child;            /* currently captured child, or NULL */
@@ -62,13 +61,13 @@ static uint32_t mixer_rate(void)
 
 static void au_addref(struct hdrp_audio *au)
 {
-	os_atomic_inc_long(&au->refs);
+	HDRP_ATOMIC_INC(&au->refs);
 }
 
 static void au_release(struct hdrp_audio *au)
 {
-	/* os_atomic_dec_long() returns the *new* value. */
-	if (os_atomic_dec_long(&au->refs) == 0) {
+	/* HDRP_ATOMIC_DEC() returns the *new* value. */
+	if (HDRP_ATOMIC_DEC(&au->refs) == 0) {
 		if (au->parent_weak)
 			obs_weak_source_release(au->parent_weak);
 		hdrp_mutex_destroy(&au->reg_mtx);
@@ -115,7 +114,7 @@ static void on_audio_capture(void *param, obs_source_t *source,
 	hdrp_mutex_lock(&au->mtx);
 
 	/* Ignore a callback that raced with a clip switch, a bind or destroy. */
-	if (os_atomic_load_long(&au->dying) || au->child != source ||
+	if (HDRP_ATOMIC_LOAD(&au->dying) || au->child != source ||
 	    !au->parent_weak) {
 		hdrp_mutex_unlock(&au->mtx);
 		return;
@@ -177,8 +176,8 @@ struct hdrp_audio *hdrp_audio_create(void)
 	struct hdrp_audio *au = bzalloc(sizeof(*au));
 	hdrp_mutex_init(&au->mtx);
 	hdrp_mutex_init(&au->reg_mtx);
-	os_atomic_set_long(&au->refs, 1);
-	os_atomic_set_long(&au->dying, 0);
+	HDRP_ATOMIC_SET(&au->refs, 1);
+	HDRP_ATOMIC_SET(&au->dying, 0);
 	return au;
 }
 
@@ -215,7 +214,7 @@ void hdrp_audio_attach(struct hdrp_audio *au, obs_source_t *child)
 	hdrp_mutex_lock(&au->reg_mtx);
 
 	hdrp_mutex_lock(&au->mtx);
-	if (os_atomic_load_long(&au->dying) || au->child == child) {
+	if (HDRP_ATOMIC_LOAD(&au->dying) || au->child == child) {
 		hdrp_mutex_unlock(&au->mtx);
 		hdrp_mutex_unlock(&au->reg_mtx);
 		return;
@@ -287,7 +286,7 @@ void hdrp_audio_destroy(struct hdrp_audio *au)
 
 	/* No new registrations from here on; detach() waits for the one
 	 * currently in progress. */
-	os_atomic_set_long(&au->dying, 1);
+	HDRP_ATOMIC_SET(&au->dying, 1);
 	hdrp_audio_detach(au);
 	/* Drop the creator's reference. If a callback is still registered the
 	 * object stays alive; otherwise it is freed right here. */

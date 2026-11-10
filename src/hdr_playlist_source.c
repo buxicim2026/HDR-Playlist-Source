@@ -187,6 +187,7 @@ struct hdr_playlist {
 /* forward declarations                                                */
 /* ------------------------------------------------------------------ */
 
+static void hdrp_update(void *data, obs_data_t *settings);
 static void hdrp_start_current(struct hdr_playlist *p);
 static void hdrp_stop_playback(struct hdr_playlist *p);
 static void hdrp_jump(struct hdr_playlist *p, bool forward);
