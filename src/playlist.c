@@ -6,6 +6,7 @@
  */
 
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -31,6 +32,12 @@ struct hdrp_playlist {
 	hdrp_play_mode mode;
 
 	uint64_t rng; /* xorshift64* for shuffle */
+
+	/* peek_next() draws the next clip once and caches it; next() consumes
+	 * the cache. Without this, SHUFFLE advanced a *copy* of the RNG while
+	 * peeking, so the preloaded clip was not the clip actually played. */
+	size_t peek_next_index;
+	bool peek_valid;
 };
 
 /* ----------------------------------------------------------------------- */
@@ -261,6 +268,7 @@ void hdrp_playlist_clear(struct hdrp_playlist *pl)
 	pl->count = 0;
 	pl->has_current = false;
 	pl->current = 0;
+	pl->peek_valid = false;
 }
 
 size_t hdrp_playlist_count(const struct hdrp_playlist *pl)
@@ -277,8 +285,10 @@ const char *hdrp_playlist_at(const struct hdrp_playlist *pl, size_t index)
 
 void hdrp_playlist_set_mode(struct hdrp_playlist *pl, hdrp_play_mode mode)
 {
-	if (mode <= HDRP_MODE_SHUFFLE)
+	if (mode <= HDRP_MODE_SHUFFLE) {
 		pl->mode = mode;
+		pl->peek_valid = false;
+	}
 }
 
 bool hdrp_playlist_has_current(const struct hdrp_playlist *pl)
@@ -301,46 +311,58 @@ void hdrp_playlist_set_current(struct hdrp_playlist *pl, size_t index)
 	if (index < pl->count) {
 		pl->current = index;
 		pl->has_current = true;
+		pl->peek_valid = false;
 	}
+}
+
+/* Computes the index following the cursor. In SHUFFLE mode this advances the
+ * RNG, so the result must be cached by peek_next() and consumed by next() —
+ * drawing twice would pick two different clips. */
+static size_t compute_next_index(struct hdrp_playlist *pl)
+{
+	if (pl->count == 0)
+		return SIZE_MAX;
+	if (!pl->has_current)
+		return 0;
+
+	switch (pl->mode) {
+	case HDRP_MODE_SEQUENTIAL:
+		return (pl->current + 1 < pl->count) ? pl->current + 1
+						    : SIZE_MAX;
+	case HDRP_MODE_LOOP:
+		return (pl->current + 1) % pl->count;
+	case HDRP_MODE_SHUFFLE: {
+		size_t pick;
+		if (pl->count == 1)
+			return 0;
+		do {
+			pick = (size_t)(rng_next(pl) % pl->count);
+		} while (pick == pl->current);
+		return pick;
+	}
+	}
+	return SIZE_MAX;
 }
 
 const char *hdrp_playlist_next(struct hdrp_playlist *pl)
 {
+	size_t idx;
+
 	if (pl->count == 0)
 		return NULL;
-	if (!pl->has_current) {
-		pl->current = 0;
-		pl->has_current = true;
-		return pl->files[0];
-	}
-
-	switch (pl->mode) {
-	case HDRP_MODE_SEQUENTIAL:
-		if (pl->current + 1 >= pl->count)
-			return NULL; /* caller decides to stop */
-		pl->current++;
-		break;
-	case HDRP_MODE_LOOP:
-		pl->current = (pl->current + 1) % pl->count;
-		break;
-	case HDRP_MODE_SHUFFLE: {
-		size_t pick;
-		if (pl->count == 1) {
-			pick = 0;
-		} else {
-			do {
-				pick = (size_t)(rng_next(pl) % pl->count);
-			} while (pick == pl->current);
-		}
-		pl->current = pick;
-		break;
-	}
-	}
-	return pl->files[pl->current];
+	/* A prior peek already drew (and advanced) the next clip: consume it. */
+	idx = pl->peek_valid ? pl->peek_next_index : compute_next_index(pl);
+	pl->peek_valid = false;
+	if (idx == SIZE_MAX)
+		return NULL; /* caller decides to stop */
+	pl->current = idx;
+	pl->has_current = true;
+	return pl->files[idx];
 }
 
 const char *hdrp_playlist_previous(struct hdrp_playlist *pl)
 {
+	pl->peek_valid = false;
 	if (pl->count == 0)
 		return NULL;
 	if (!pl->has_current) {
@@ -375,11 +397,13 @@ const char *hdrp_playlist_previous(struct hdrp_playlist *pl)
 
 const char *hdrp_playlist_peek_next(struct hdrp_playlist *pl)
 {
-	/* Work on a shallow copy: scalars (current/has_current/rng) are
-	 * per-copy; the file array is shared but read-only here. */
-	struct hdrp_playlist tmp = *pl;
-	hdrp_playlist_next(&tmp);
-	return hdrp_playlist_has_current(&tmp) ? tmp.files[tmp.current] : NULL;
+	if (!pl->peek_valid) {
+		pl->peek_next_index = compute_next_index(pl);
+		pl->peek_valid = true;
+	}
+	return pl->peek_next_index < pl->count
+		       ? pl->files[pl->peek_next_index]
+		       : NULL;
 }
 
 

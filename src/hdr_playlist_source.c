@@ -63,6 +63,75 @@ enum {
 	MIXED_FORCE_HLG,
 };
 
+/* ------------------------------------------------------------------ */
+/* Control channel                                                     */
+/*                                                                     */
+/* OBS invokes update(), media controls, hotkeys, show/hide/activate and
+ * properties on the UI thread, while video_tick()/video_render() run on
+ * the video thread. Rather than guarding every field of `sw` and `p` (and
+ * risking an AB-BA deadlock with libobs' own locks), ALL control requests
+ * are posted here and executed exclusively by video_tick(). UI readers get
+ * a published immutable snapshot instead of touching live state.
+ * ------------------------------------------------------------------ */
+
+#define HDRP_CMD_CAP 64
+
+enum hdrp_cmd {
+	HDRP_CMD_PLAY_PAUSE, /* arg: -1 toggle, 0 play, 1 pause */
+	HDRP_CMD_RESTART,
+	HDRP_CMD_STOP,
+	HDRP_CMD_NEXT,
+	HDRP_CMD_PREV,
+	HDRP_CMD_SEEK, /* arg: milliseconds */
+	HDRP_CMD_SHOW,
+	HDRP_CMD_HIDE,
+	HDRP_CMD_ACTIVATE,
+};
+
+struct hdrp_command {
+	enum hdrp_cmd type;
+	int64_t arg;
+};
+
+/* Everything parsed out of obs_data_t on the UI thread. Owned by the
+ * control channel until the video thread applies (or discards) it. */
+struct hdrp_config {
+	int mode;
+	bool hw_decode;
+	int speed_percent;
+	bool use_transition;
+	int transition_ms;
+	bool low_memory;
+	int visibility;
+	int mixed;
+	bool adapt_canvas;
+	int deinterlace_mode;
+	long long saved_index;
+	char **files;
+	size_t count;
+};
+
+/* Published by the video thread once per frame; UI readers copy it under
+ * `mutex` and never dereference p->sw / p->pl / p->au themselves. */
+struct hdrp_status {
+	bool stopped;
+	bool showing;
+	bool has_current;
+	size_t current_index;
+	size_t playlist_count;
+	int64_t duration_ms;
+	int64_t time_ms;
+	enum obs_media_state media_state;
+	int deinterlace_mode;
+	bool output_hdr;
+	uint32_t canvas_w;
+	uint32_t canvas_h;
+	uint32_t media_w;
+	uint32_t media_h;
+	enum gs_color_space content_space;
+	uint32_t audio_channels;
+};
+
 struct hdr_playlist {
 	obs_source_t *source;
 
@@ -70,7 +139,16 @@ struct hdr_playlist {
 	struct hdrp_switcher *sw;
 	struct hdrp_audio *au;
 
+	/* Protects the command ring, pending_cfg and the status snapshot.
+	 * The playlist, switcher and all scalar playback state are now
+	 * video-thread-only and need no lock. */
 	hdrp_mutex_t mutex;
+
+	struct hdrp_command cmds[HDRP_CMD_CAP];
+	int cmd_head;
+	int cmd_count;
+	struct hdrp_config *pending_cfg; /* newest settings wins */
+	struct hdrp_status status;
 
 	bool hw_decode;
 	int speed_percent;
@@ -106,10 +184,126 @@ struct hdr_playlist {
 };
 
 /* ------------------------------------------------------------------ */
+/* forward declarations                                                */
+/* ------------------------------------------------------------------ */
 
 static void hdrp_start_current(struct hdr_playlist *p);
 static void hdrp_stop_playback(struct hdr_playlist *p);
-static void hdrp_update(void *data, obs_data_t *settings);
+static void hdrp_jump(struct hdr_playlist *p, bool forward);
+static void hdrp_playlist_changed(struct hdr_playlist *p);
+static void hdrp_apply_config(struct hdr_playlist *p,
+			      struct hdrp_config *cfg);
+static void hdrp_drain_commands(struct hdr_playlist *p);
+
+/* ------------------------------------------------------------------ */
+/* control channel plumbing                                            */
+/* ------------------------------------------------------------------ */
+
+static void hdrp_config_free(struct hdrp_config *cfg)
+{
+	if (!cfg)
+		return;
+	for (size_t i = 0; i < cfg->count; i++)
+		bfree(cfg->files[i]);
+	bfree(cfg->files);
+	bfree(cfg);
+}
+
+/* UI thread: publish a freshly parsed settings snapshot. */
+static void hdrp_post_config(struct hdr_playlist *p, struct hdrp_config *cfg)
+{
+	struct hdrp_config *old;
+
+	if (!p)
+		return;
+	hdrp_mutex_lock(&p->mutex);
+	old = p->pending_cfg;
+	p->pending_cfg = cfg;
+	hdrp_mutex_unlock(&p->mutex);
+	hdrp_config_free(old);
+}
+
+/* UI thread: enqueue a control request. */
+static void hdrp_post(struct hdr_playlist *p, enum hdrp_cmd type, int64_t arg)
+{
+	if (!p)
+		return;
+	hdrp_mutex_lock(&p->mutex);
+	if (p->cmd_count < HDRP_CMD_CAP) {
+		int slot = (p->cmd_head + p->cmd_count) % HDRP_CMD_CAP;
+		p->cmds[slot].type = type;
+		p->cmds[slot].arg = arg;
+		p->cmd_count++;
+	} else {
+		blog(LOG_WARNING,
+		     "[HDR-PL] control queue full, dropped command %d",
+		     (int)type);
+	}
+	hdrp_mutex_unlock(&p->mutex);
+}
+
+/* Video thread: take the newest config, if any. */
+static struct hdrp_config *hdrp_take_config(struct hdr_playlist *p)
+{
+	struct hdrp_config *cfg;
+
+	hdrp_mutex_lock(&p->mutex);
+	cfg = p->pending_cfg;
+	p->pending_cfg = NULL;
+	hdrp_mutex_unlock(&p->mutex);
+	return cfg;
+}
+
+/* UI thread: read-only snapshot of the last published frame state. */
+static void hdrp_status_snapshot(struct hdr_playlist *p,
+				 struct hdrp_status *out)
+{
+	if (!p) {
+		memset(out, 0, sizeof(*out));
+		out->media_state = OBS_MEDIA_STATE_STOPPED;
+		return;
+	}
+	hdrp_mutex_lock(&p->mutex);
+	*out = p->status;
+	hdrp_mutex_unlock(&p->mutex);
+}
+
+/* Video thread only: build (and then publish) the UI-visible snapshot. */
+static void hdrp_compute_status(struct hdr_playlist *p,
+				struct hdrp_status *st)
+{
+	static const enum gs_color_space pref[1] = { GS_CS_SRGB };
+	uint32_t w = 0, h = 0;
+
+	memset(st, 0, sizeof(*st));
+	st->stopped = p->stopped;
+	st->showing = p->showing;
+	st->playlist_count = hdrp_playlist_count(p->pl);
+	st->has_current = hdrp_playlist_has_current(p->pl);
+	st->current_index = hdrp_playlist_current_index(p->pl);
+	st->duration_ms = hdrp_switcher_get_duration(p->sw);
+	st->time_ms = hdrp_switcher_get_time(p->sw);
+	st->media_state = (p->stopped || st->playlist_count == 0)
+				  ? OBS_MEDIA_STATE_STOPPED
+				  : hdrp_switcher_get_state(p->sw);
+	st->deinterlace_mode = p->deinterlace_mode;
+	st->output_hdr = p->output_hdr;
+	st->canvas_w = p->canvas_w;
+	st->canvas_h = p->canvas_h;
+	hdrp_switcher_get_media_size(p->sw, &w, &h);
+	st->media_w = w;
+	st->media_h = h;
+	st->content_space = hdrp_switcher_content_space(p->sw, 1, pref);
+	st->audio_channels = hdrp_audio_channels(p->au);
+}
+
+static void hdrp_publish_status(struct hdr_playlist *p,
+			       const struct hdrp_status *st)
+{
+	hdrp_mutex_lock(&p->mutex);
+	p->status = *st;
+	hdrp_mutex_unlock(&p->mutex);
+}
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -183,35 +377,31 @@ static const char *hdrp_deint_name(int mode)
  * channel count and the deinterlacing currently applied. OBS does not expose a
  * media file's own frame rate or interlace flag to plugins, so the frame rate
  * shown is the output (canvas) one. */
-static void hdrp_build_info_media(struct hdr_playlist *p, char *buf,
+static void hdrp_build_info_media(const struct hdrp_status *st, char *buf,
 				  size_t size)
 {
-	uint32_t mw = 0, mh = 0;
-	enum gs_color_space cs = GS_CS_SRGB;
 	bool hdr = false;
 	const char *csname;
 
-	if (!p || p->stopped || !hdrp_switcher_active_path(p->sw)) {
+	if (!st) {
+		if (buf && size)
+			buf[0] = '\0';
+		return;
+	}
+	if (st->stopped || !st->media_w || !st->media_h) {
 		snprintf(buf, size, "%s%s", obs_module_text("InfoMedia"),
 			 obs_module_text("InfoIdle"));
 		return;
 	}
-
-	{
-		const enum gs_color_space pref[1] = { GS_CS_SRGB };
-		cs = hdrp_switcher_content_space(p->sw, 1, pref);
-	}
-	csname = hdrp_space_name(cs, &hdr);
-	hdrp_switcher_get_media_size(p->sw, &mw, &mh);
-
+	csname = hdrp_space_name(st->content_space, &hdr);
 	snprintf(buf, size, "%s%ux%u · %s · %s · audio %uch · deint %s",
-		 obs_module_text("InfoMedia"), mw, mh, csname,
-		 hdr ? "HDR" : "SDR", hdrp_audio_channels(p->au),
-		 hdrp_deint_name(p->deinterlace_mode));
+		 obs_module_text("InfoMedia"), st->media_w, st->media_h,
+		 csname, hdr ? "HDR" : "SDR", st->audio_channels,
+		 hdrp_deint_name(st->deinterlace_mode));
 }
 
 /* Output side: canvas size/frame rate, output colour space and HDR session. */
-static void hdrp_build_info_output(struct hdr_playlist *p, char *buf,
+static void hdrp_build_info_output(const struct hdrp_status *st, char *buf,
 				   size_t size)
 {
 	struct obs_video_info ovi;
@@ -228,7 +418,7 @@ static void hdrp_build_info_output(struct hdr_playlist *p, char *buf,
 	snprintf(buf, size, "%s%ux%u @ %ufps · %s · %s",
 		 obs_module_text("InfoOutput"), ovi.base_width, ovi.base_height,
 		 fps, hdrp_output_space_name(ovi.colorspace),
-		 (p && p->output_hdr) ? "HDR session" : "SDR session");
+		 (st && st->output_hdr) ? "HDR session" : "SDR session");
 }
 
 /* Queued onto the UI thread so we never emit the properties signal from the
@@ -335,114 +525,168 @@ static size_t cursor_to_path(struct hdr_playlist *p, const char *path)
 	return SIZE_MAX;
 }
 
-static void load_files_from_settings(struct hdr_playlist *p,
-				     obs_data_t *settings)
+/* Filesystem work, no lock held. The "Add folder…" picker expands the chosen
+ * directory straight into the playlist settings, then clears the picker. */
+static void hdrp_apply_add_folder(obs_data_t *settings, const char *add_dir)
 {
-	char *keep = NULL;
-	const char *cur = hdrp_playlist_current(p->pl);
-	long long saved;
+	obs_data_array_t *old = obs_data_get_array(settings, KEY_FILES);
+	obs_data_array_t *merged = obs_data_array_create();
+	struct hdrp_playlist *tmp = hdrp_playlist_create();
+	size_t added;
 
-	if (cur)
-		keep = bstrdup(cur);
-
-	hdrp_playlist_clear(p->pl);
-
-	obs_data_array_t *arr = obs_data_get_array(settings, KEY_FILES);
-	obs_data_array_t *out = obs_data_array_create();
-	bool expanded = false;
-
-	if (arr) {
-		size_t n = obs_data_array_count(arr);
+	if (old) {
+		size_t n = obs_data_array_count(old);
 		for (size_t i = 0; i < n; i++) {
-			obs_data_t *item = obs_data_array_item(arr, i);
-			const char *path;
-			if (!item)
-				continue;
-			path = obs_data_get_string(item, "value");
-			if (path && *path) {
-				obs_data_t *it;
-				if (hdrp_playlist_path_is_dir(path)) {
-					/* A folder was dropped (or typed) into
-					 * the list: expand it into its media
-					 * files so the entry is playable. */
-					size_t before =
-						hdrp_playlist_count(p->pl);
-					size_t after;
-					hdrp_playlist_add_folder(p->pl, path, 4);
-					after = hdrp_playlist_count(p->pl);
-					for (size_t k = before; k < after; k++) {
-						it = obs_data_create();
-						obs_data_set_string(
-							it, "value",
-							hdrp_playlist_at(
-								p->pl, k));
-						obs_data_array_push_back(
-							out, it);
-						obs_data_release(it);
-					}
-					expanded = true;
-					blog(LOG_INFO,
-					     "[HDR-PL] expanded folder '%s' "
-					     "-> %zu file(s)",
-					     path, after - before);
-				} else {
-					hdrp_playlist_add_file(p->pl, path);
-					it = obs_data_create();
-					obs_data_set_string(it, "value", path);
-					obs_data_array_push_back(out, it);
-					obs_data_release(it);
-				}
+			obs_data_t *it = obs_data_array_item(old, i);
+			if (it) {
+				obs_data_array_push_back(merged, it);
+				obs_data_release(it);
 			}
-			obs_data_release(item);
 		}
-		obs_data_array_release(arr);
+		obs_data_array_release(old);
 	}
 
-	/* Write the expanded list back so the properties dialog shows the
-	 * individual files instead of the folder entry. */
-	if (expanded)
-		obs_data_set_array(settings, KEY_FILES, out);
-	obs_data_array_release(out);
-
-	if (keep) {
-		if (cursor_to_path(p, keep) == SIZE_MAX &&
-		    hdrp_playlist_count(p->pl) > 0)
-			hdrp_playlist_set_current(p->pl, 0);
-		bfree(keep);
+	added = hdrp_playlist_add_folder(tmp, add_dir, 4);
+	for (size_t i = 0; i < added; i++) {
+		obs_data_t *it = obs_data_create();
+		obs_data_set_string(it, "value", hdrp_playlist_at(tmp, i));
+		obs_data_array_push_back(merged, it);
+		obs_data_release(it);
 	}
+	hdrp_playlist_destroy(tmp);
 
-	saved = obs_data_get_int(settings, KEY_SAVED_INDEX);
-	if (saved >= 0 && (size_t)saved < hdrp_playlist_count(p->pl) &&
-	    !hdrp_playlist_has_current(p->pl))
-		hdrp_playlist_set_current(p->pl, (size_t)saved);
+	obs_data_set_array(settings, KEY_FILES, merged);
+	obs_data_array_release(merged);
+	/* Log before clearing: `add_dir` points into settings and is invalidated
+	 * as soon as the value is replaced. */
+	blog(LOG_INFO, "[HDR-PL] added %zu file(s) from folder '%s'",
+	     added, add_dir);
+	obs_data_set_string(settings, KEY_ADD_FOLDER, "");
 }
 
-static bool files_list_changed(struct hdr_playlist *p, obs_data_t *settings)
+/* Filesystem work, ALWAYS called without p->mutex held. Replaces directory
+ * entries in KEY_FILES with the media files they contain, so the locked part
+ * of hdrp_update() only manipulates strings in memory. Recursive scans used to
+ * run while the video thread waited on that same mutex, stalling rendering
+ * for seconds (which looks exactly like an output dropout). */
+static void hdrp_expand_folder_entries(obs_data_t *settings)
 {
 	obs_data_array_t *arr = obs_data_get_array(settings, KEY_FILES);
-	bool changed;
+	obs_data_array_t *out;
 	size_t n;
-	size_t i;
+	bool expanded = false;
 
 	if (!arr)
-		return hdrp_playlist_count(p->pl) > 0;
-
+		return;
+	out = obs_data_array_create();
 	n = obs_data_array_count(arr);
-	changed = n != hdrp_playlist_count(p->pl);
-	for (i = 0; i < n && !changed; i++) {
+	for (size_t i = 0; i < n; i++) {
 		obs_data_t *item = obs_data_array_item(arr, i);
 		const char *path;
-		const char *cur;
+
 		if (!item)
 			continue;
 		path = obs_data_get_string(item, "value");
-		cur = hdrp_playlist_at(p->pl, i);
-		if (!cur || !path || strcmp(cur, path) != 0)
-			changed = true;
+		if (path && *path && hdrp_playlist_path_is_dir(path)) {
+			struct hdrp_playlist *tmp = hdrp_playlist_create();
+			size_t added = hdrp_playlist_add_folder(tmp, path, 4);
+
+			for (size_t k = 0; k < added; k++) {
+				obs_data_t *it = obs_data_create();
+				obs_data_set_string(it, "value",
+						    hdrp_playlist_at(tmp, k));
+				obs_data_array_push_back(out, it);
+				obs_data_release(it);
+			}
+			hdrp_playlist_destroy(tmp);
+			expanded = true;
+			blog(LOG_INFO,
+			     "[HDR-PL] expanded folder '%s' -> %zu file(s)",
+			     path, added);
+		} else if (path && *path) {
+			obs_data_array_push_back(out, item);
+		}
 		obs_data_release(item);
 	}
 	obs_data_array_release(arr);
-	return changed;
+	if (expanded)
+		obs_data_set_array(settings, KEY_FILES, out);
+	obs_data_array_release(out);
+}
+
+/* Video thread only. Compare an incoming settings snapshot with the live
+ * playlist — the old check ran on the UI thread against p->pl, which is now
+ * video-thread-owned. */
+static bool config_list_differs(struct hdr_playlist *p,
+			       const struct hdrp_config *cfg)
+{
+	size_t n = hdrp_playlist_count(p->pl);
+
+	if (cfg->count != n)
+		return true;
+	for (size_t i = 0; i < n; i++) {
+		const char *cur = hdrp_playlist_at(p->pl, i);
+		if (!cur || strcmp(cur, cfg->files[i]) != 0)
+			return true;
+	}
+	return false;
+}
+
+/* Video thread only. Applies a settings snapshot to p, pl and sw, then frees
+ * it. Nothing here is reachable from a UI thread. */
+static void hdrp_apply_config(struct hdr_playlist *p,
+			     struct hdrp_config *cfg)
+{
+	bool list_changed = config_list_differs(p, cfg);
+	int ms;
+
+	p->hw_decode = cfg->hw_decode;
+	p->speed_percent = (cfg->speed_percent >= 1 && cfg->speed_percent <= 200)
+				   ? cfg->speed_percent
+				   : 100;
+	p->use_transition = cfg->use_transition;
+	p->transition_ms = cfg->transition_ms > 0 ? cfg->transition_ms : 0;
+	p->low_memory = cfg->low_memory;
+	p->visibility = cfg->visibility;
+	p->mixed = cfg->mixed;
+	p->adapt_canvas = cfg->adapt_canvas;
+	p->deinterlace_mode = cfg->deinterlace_mode;
+	hdrp_playlist_set_mode(p->pl, (hdrp_play_mode)cfg->mode);
+
+	if (list_changed) {
+		char *keep = NULL;
+		const char *cur = hdrp_playlist_current(p->pl);
+
+		if (cur)
+			keep = bstrdup(cur);
+
+		hdrp_playlist_clear(p->pl);
+		for (size_t i = 0; i < cfg->count; i++)
+			hdrp_playlist_add_file(p->pl, cfg->files[i]);
+
+		if (keep) {
+			if (cursor_to_path(p, keep) == SIZE_MAX &&
+			    hdrp_playlist_count(p->pl) > 0)
+				hdrp_playlist_set_current(p->pl, 0);
+			bfree(keep);
+		}
+		if (cfg->saved_index >= 0 &&
+		    (size_t)cfg->saved_index < hdrp_playlist_count(p->pl) &&
+		    !hdrp_playlist_has_current(p->pl))
+			hdrp_playlist_set_current(p->pl,
+						  (size_t)cfg->saved_index);
+	}
+
+	ms = (p->use_transition && !p->low_memory) ? p->transition_ms : 0;
+	hdrp_switcher_set_transition_ms(p->sw, ms);
+	hdrp_switcher_set_preload_enabled(p->sw, !p->low_memory);
+	hdrp_switcher_set_deinterlace(p->sw, p->deinterlace_mode);
+	hdrp_sync_output_config(p);
+
+	if (list_changed)
+		hdrp_playlist_changed(p);
+
+	hdrp_config_free(cfg);
 }
 
 /* ------------------------------------------------------------------ */
@@ -463,10 +707,8 @@ static void hdrp_start_current(struct hdr_playlist *p)
 	char *path = NULL;
 	struct hdrp_switcher_opts opts;
 
-	/* Copy the path while holding the lock: applying settings rebuilds the
-	 * list on the UI thread and frees the very strings the playlist hands
-	 * out, so the playlist must never be dereferenced outside the lock. */
-	hdrp_mutex_lock(&p->mutex);
+	/* Video-thread-only: settings are now applied by hdrp_apply_config()
+	 * on this same thread, so the playlist cannot be freed underneath us. */
 	if (hdrp_playlist_count(p->pl) > 0) {
 		const char *cur = hdrp_playlist_current(p->pl);
 
@@ -477,7 +719,6 @@ static void hdrp_start_current(struct hdr_playlist *p)
 		if (cur)
 			path = bstrdup(cur);
 	}
-	hdrp_mutex_unlock(&p->mutex);
 	if (!path)
 		return;
 
@@ -491,7 +732,17 @@ static void hdrp_start_current(struct hdr_playlist *p)
 
 	p->stopped = false;
 	p->hb_seconds = 0.0f;
-	hdrp_switcher_play(p->sw, path, &opts);
+	if (!hdrp_switcher_play(p->sw, path, &opts)) {
+		/* ffmpeg_source could not be created (obs-ffmpeg missing, or a
+		 * libobs version we do not support). Never report "playing"
+		 * while producing zero frames. */
+		bfree(path);
+		p->stopped = true;
+		blog(LOG_ERROR, "[HDR-PL] failed to open the media source; "
+				"playback stopped (check that obs-ffmpeg is "
+				"loaded and OBS is 31.0 or newer)");
+		return;
+	}
 	bfree(path);
 	if (p->au)
 		hdrp_attach_audio_to_active(p);
@@ -532,14 +783,12 @@ static void hdrp_try_preload_next(struct hdr_playlist *p)
 	if (p->low_memory || hdrp_switcher_is_transitioning(p->sw))
 		return;
 
-	hdrp_mutex_lock(&p->mutex);
 	if (hdrp_playlist_count(p->pl) > 0) {
 		const char *n = hdrp_playlist_peek_next(p->pl);
 
 		if (n)
 			next = bstrdup(n);
 	}
-	hdrp_mutex_unlock(&p->mutex);
 	if (!next)
 		return;
 
@@ -559,13 +808,11 @@ static void hdrp_switcher_ended(void *opaque)
 	if (!p || p->stopped)
 		return;
 
-	hdrp_mutex_lock(&p->mutex);
 	if (hdrp_playlist_peek_next(p->pl)) {
 		hdrp_playlist_next(p->pl);
 		if (hdrp_playlist_current(p->pl))
 			path = bstrdup(hdrp_playlist_current(p->pl));
 	}
-	hdrp_mutex_unlock(&p->mutex);
 
 	if (!path) {
 		hdrp_finish_at_end(p);
@@ -573,7 +820,11 @@ static void hdrp_switcher_ended(void *opaque)
 	}
 
 	hdrp_apply_opts(p, &opts);
-	hdrp_switcher_play(p->sw, path, &opts);
+	if (!hdrp_switcher_play(p->sw, path, &opts)) {
+		bfree(path);
+		hdrp_finish_at_end(p);
+		return;
+	}
 	bfree(path);
 	hdrp_attach_audio_to_active(p);
 	obs_source_media_started(p->source);
@@ -586,7 +837,6 @@ static void hdrp_jump(struct hdr_playlist *p, bool forward)
 	char *target = NULL;
 	struct hdrp_switcher_opts opts;
 
-	hdrp_mutex_lock(&p->mutex);
 	if (hdrp_playlist_count(p->pl) > 0) {
 		if (hdrp_playlist_count(p->pl) > 1) {
 			const char *t = forward ? hdrp_playlist_next(p->pl)
@@ -597,7 +847,6 @@ static void hdrp_jump(struct hdr_playlist *p, bool forward)
 		if (hdrp_playlist_current(p->pl))
 			target = bstrdup(hdrp_playlist_current(p->pl));
 	}
-	hdrp_mutex_unlock(&p->mutex);
 	if (!target)
 		return;
 
@@ -609,7 +858,13 @@ static void hdrp_jump(struct hdr_playlist *p, bool forward)
 
 	hdrp_apply_opts(p, &opts);
 	hdrp_switcher_drop_preload(p->sw);
-	hdrp_switcher_play(p->sw, target, &opts);
+	if (!hdrp_switcher_play(p->sw, target, &opts)) {
+		bfree(target);
+		p->stopped = true;
+		blog(LOG_ERROR, "[HDR-PL] failed to open the media source "
+				"while jumping; playback stopped");
+		return;
+	}
 	bfree(target);
 	hdrp_attach_audio_to_active(p);
 	p->need_preload_retry = true;
@@ -619,14 +874,12 @@ static void hdrp_jump(struct hdr_playlist *p, bool forward)
 /* The playlist was edited. Make it take effect immediately. */
 static void hdrp_playlist_changed(struct hdr_playlist *p)
 {
-	const char *playing = hdrp_switcher_active_path(p->sw);
+	char *playing = hdrp_switcher_active_path_dup(p->sw);
 	bool still_listed = false;
 
-	if (!p->stopped && playing) {
-		hdrp_mutex_lock(&p->mutex);
+	if (!p->stopped && playing)
 		still_listed = cursor_to_path(p, playing) != SIZE_MAX;
-		hdrp_mutex_unlock(&p->mutex);
-	}
+	bfree(playing);
 
 	if (still_listed) {
 		/* The running clip survived the edit: keep it, but re-arm the
@@ -645,67 +898,171 @@ static void hdrp_playlist_changed(struct hdr_playlist *p)
 }
 
 /* ------------------------------------------------------------------ */
-/* hotkeys                                                             */
-/* ------------------------------------------------------------------ */
+/* command execution — VIDEO THREAD ONLY                               */
+/*                                                                     */
+/* Everything below touches p, pl, sw or au directly. It is reached
+ * exclusively from hdrp_video_tick() -> hdrp_drain_commands().
+ * ------------------------------------------------------------------ */
 
-static void hotkey_play_pause(void *data, obs_hotkey_id id,
-			      obs_hotkey_t *hotkey, bool pressed)
+static void do_play_pause(struct hdr_playlist *p, int64_t arg)
 {
-	struct hdr_playlist *p = data;
-	enum obs_media_state st;
+	enum obs_media_state st = hdrp_switcher_get_state(p->sw);
 
-	UNUSED_PARAMETER(id);
-	UNUSED_PARAMETER(hotkey);
-	if (!p || !pressed)
+	if (arg < 0) { /* hotkey: toggle */
+		if (st == OBS_MEDIA_STATE_PLAYING)
+			hdrp_switcher_set_paused(p->sw, true);
+		else if (st == OBS_MEDIA_STATE_PAUSED)
+			hdrp_switcher_set_paused(p->sw, false);
+		else
+			hdrp_start_current(p);
 		return;
-
-	st = hdrp_switcher_get_state(p->sw);
-	if (st == OBS_MEDIA_STATE_PLAYING)
-		hdrp_switcher_set_paused(p->sw, true);
-	else if (st == OBS_MEDIA_STATE_PAUSED)
+	}
+	if (arg) {
+		if (st == OBS_MEDIA_STATE_PLAYING)
+			hdrp_switcher_set_paused(p->sw, true);
+		return;
+	}
+	if (st == OBS_MEDIA_STATE_PAUSED)
 		hdrp_switcher_set_paused(p->sw, false);
 	else
 		hdrp_start_current(p);
 }
 
+static void do_show(struct hdr_playlist *p)
+{
+	p->showing = true;
+
+	if (p->stopped && hdrp_playlist_count(p->pl) > 0) {
+		if (p->visibility == VIS_STOP_NEXT)
+			hdrp_jump(p, true);
+		else
+			hdrp_start_current(p);
+		return;
+	}
+	if (p->visibility == VIS_PAUSE_RESUME && !p->stopped)
+		hdrp_switcher_set_paused(p->sw, false);
+}
+
+static void do_hide(struct hdr_playlist *p)
+{
+	p->showing = false;
+
+	if (p->visibility == VIS_ALWAYS_PLAY)
+		return;
+	if (p->visibility == VIS_PAUSE_RESUME) {
+		hdrp_switcher_set_paused(p->sw, true);
+		return;
+	}
+	hdrp_stop_playback(p);
+}
+
+static void do_activate(struct hdr_playlist *p)
+{
+	if (hdrp_playlist_count(p->pl) == 0 || !p->stopped)
+		return;
+	hdrp_start_current(p);
+}
+
+static void hdrp_exec_command(struct hdr_playlist *p,
+			     const struct hdrp_command *c)
+{
+	switch (c->type) {
+	case HDRP_CMD_PLAY_PAUSE:
+		do_play_pause(p, c->arg);
+		break;
+	case HDRP_CMD_RESTART:
+		hdrp_start_current(p);
+		break;
+	case HDRP_CMD_STOP:
+		hdrp_stop_playback(p);
+		break;
+	case HDRP_CMD_NEXT:
+		hdrp_jump(p, true);
+		break;
+	case HDRP_CMD_PREV:
+		hdrp_jump(p, false);
+		break;
+	case HDRP_CMD_SEEK:
+		hdrp_switcher_seek(p->sw, c->arg);
+		break;
+	case HDRP_CMD_SHOW:
+		do_show(p);
+		break;
+	case HDRP_CMD_HIDE:
+		do_hide(p);
+		break;
+	case HDRP_CMD_ACTIVATE:
+		do_activate(p);
+		break;
+	}
+}
+
+static void hdrp_drain_commands(struct hdr_playlist *p)
+{
+	struct hdrp_command batch[HDRP_CMD_CAP];
+	int n;
+
+	hdrp_mutex_lock(&p->mutex);
+	n = p->cmd_count;
+	for (int i = 0; i < n; i++)
+		batch[i] = p->cmds[(p->cmd_head + i) % HDRP_CMD_CAP];
+	p->cmd_head = (p->cmd_head + n) % HDRP_CMD_CAP;
+	p->cmd_count = 0;
+	hdrp_mutex_unlock(&p->mutex);
+
+	/* Execute outside the lock: commands call into libobs and may queue UI
+	 * tasks, neither of which may happen under our control lock. */
+	for (int i = 0; i < n; i++)
+		hdrp_exec_command(p, &batch[i]);
+}
+
+/* ------------------------------------------------------------------ */
+/* hotkeys (UI thread — post only)                                     */
+/* ------------------------------------------------------------------ */
+
+static void hotkey_play_pause(void *data, obs_hotkey_id id,
+			      obs_hotkey_t *hotkey, bool pressed)
+{
+	UNUSED_PARAMETER(id);
+	UNUSED_PARAMETER(hotkey);
+	if (data && pressed)
+		hdrp_post(data, HDRP_CMD_PLAY_PAUSE, -1);
+}
+
 static void hotkey_restart(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey,
 			   bool pressed)
 {
-	struct hdr_playlist *p = data;
 	UNUSED_PARAMETER(id);
 	UNUSED_PARAMETER(hotkey);
-	if (p && pressed)
-		hdrp_start_current(p);
+	if (data && pressed)
+		hdrp_post(data, HDRP_CMD_RESTART, 0);
 }
 
 static void hotkey_stop(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey,
 			bool pressed)
 {
-	struct hdr_playlist *p = data;
 	UNUSED_PARAMETER(id);
 	UNUSED_PARAMETER(hotkey);
-	if (p && pressed)
-		hdrp_stop_playback(p);
+	if (data && pressed)
+		hdrp_post(data, HDRP_CMD_STOP, 0);
 }
 
 static void hotkey_next(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey,
 			bool pressed)
 {
-	struct hdr_playlist *p = data;
 	UNUSED_PARAMETER(id);
 	UNUSED_PARAMETER(hotkey);
-	if (p && pressed)
-		hdrp_jump(p, true);
+	if (data && pressed)
+		hdrp_post(data, HDRP_CMD_NEXT, 0);
 }
 
 static void hotkey_prev(void *data, obs_hotkey_id id, obs_hotkey_t *hotkey,
 			bool pressed)
 {
-	struct hdr_playlist *p = data;
 	UNUSED_PARAMETER(id);
 	UNUSED_PARAMETER(hotkey);
-	if (p && pressed)
-		hdrp_jump(p, false);
+	if (data && pressed)
+		hdrp_post(data, HDRP_CMD_PREV, 0);
 }
 
 /* ------------------------------------------------------------------ */
@@ -740,9 +1097,10 @@ static void *hdrp_create(obs_data_t *settings, obs_source_t *source)
 	p->mixed = MIXED_AUTO;
 	p->adapt_canvas = true;
 	p->stopped = true;
+	p->status.media_state = OBS_MEDIA_STATE_STOPPED;
 
-	hdrp_switcher_set_transition_ms(p->sw, 0);
-
+	/* Do NOT touch the switcher here: create() runs on the UI thread.
+	 * The first video_tick() applies the posted config instead. */
 	p->hk_play_pause = obs_hotkey_register_source(
 		source, "HDR-Playlist-Source.PlayPause",
 		obs_module_text("HotkeyPlayPause"), hotkey_play_pause, p);
@@ -759,180 +1117,142 @@ static void *hdrp_create(obs_data_t *settings, obs_source_t *source)
 		source, "HDR-Playlist-Source.Prev",
 		obs_module_text("HotkeyPrev"), hotkey_prev, p);
 
-	hdrp_update(p, settings);
-	hdrp_sync_output_config(p);
+	hdrp_update(p, settings); /* posts the initial config for tick() */
 	return p;
 }
 
 static void hdrp_destroy(void *data)
 {
 	struct hdr_playlist *p = data;
+	struct hdrp_config *cfg;
+
 	if (!p)
 		return;
 
+	/* libobs guarantees destroy() is not inside a video tick, so drain
+	 * anything still queued before releasing the memory it owns. */
+	hdrp_mutex_lock(&p->mutex);
+	cfg = p->pending_cfg;
+	p->pending_cfg = NULL;
+	p->cmd_count = 0;
+	p->cmd_head = 0;
+	hdrp_mutex_unlock(&p->mutex);
+	hdrp_config_free(cfg);
+
 	hdrp_audio_destroy(p->au);
+	p->au = NULL;
 	hdrp_switcher_destroy(p->sw);
 	hdrp_playlist_destroy(p->pl);
 	hdrp_mutex_destroy(&p->mutex);
 	bfree(p);
 }
 
+/* UI thread. Parse settings into an owned snapshot; the video thread applies
+ * it. This callback never touches p->sw, p->pl or any playback state. */
 static void hdrp_update(void *data, obs_data_t *settings)
 {
 	struct hdr_playlist *p = data;
-	bool list_changed = false;
+	struct hdrp_config *cfg;
+	obs_data_array_t *arr;
 	long long mode;
-	int ms;
 
 	if (!p)
 		return;
 
-	hdrp_mutex_lock(&p->mutex);
-	mode = obs_data_get_int(settings, KEY_MODE);
-	if (mode >= HDRP_MODE_SEQUENTIAL && mode <= HDRP_MODE_SHUFFLE)
-		hdrp_playlist_set_mode(p->pl, (hdrp_play_mode)mode);
-	p->hw_decode = obs_data_get_bool(settings, KEY_HW_DECODE);
-	p->speed_percent = (int)obs_data_get_int(settings, KEY_SPEED);
-	if (p->speed_percent < 1 || p->speed_percent > 200)
-		p->speed_percent = 100;
-	p->use_transition = obs_data_get_bool(settings, KEY_USE_TRANSITION);
-	p->transition_ms = (int)obs_data_get_int(settings, KEY_TRANSITION_MS);
-	if (p->transition_ms < 0)
-		p->transition_ms = 0;
-	p->low_memory = obs_data_get_bool(settings, KEY_LOW_MEMORY);
-	p->visibility = (int)obs_data_get_int(settings, KEY_VISIBILITY);
-	p->mixed = (int)obs_data_get_int(settings, KEY_MIXED);
-	p->adapt_canvas = obs_data_get_bool(settings, KEY_ADAPT_CANVAS);
-	p->deinterlace_mode = (int)obs_data_get_int(settings, KEY_DEINTERLACE);
-
-	/* "Add folder…" picker: expand the chosen directory straight into the
-	 * playlist settings, then clear the picker so it can be reused. */
+	/* Filesystem work stays on the UI thread with no locks held, so a slow
+	 * or network folder scan cannot stall the video thread. */
 	{
-		const char *add_dir = obs_data_get_string(settings, KEY_ADD_FOLDER);
-		if (add_dir && *add_dir) {
-			obs_data_array_t *old = obs_data_get_array(settings,
-								   KEY_FILES);
-			obs_data_array_t *merged = obs_data_array_create();
-			struct hdrp_playlist *tmp = hdrp_playlist_create();
-			size_t added;
+		const char *add_dir =
+			obs_data_get_string(settings, KEY_ADD_FOLDER);
+		if (add_dir && *add_dir)
+			hdrp_apply_add_folder(settings, add_dir);
+	}
+	hdrp_expand_folder_entries(settings);
 
-			if (old) {
-				size_t n = obs_data_array_count(old);
-				for (size_t i = 0; i < n; i++) {
-					obs_data_t *it =
-						obs_data_array_item(old, i);
-					if (it) {
-						obs_data_array_push_back(
-							merged, it);
-						obs_data_release(it);
-					}
-				}
-				obs_data_array_release(old);
+	cfg = bzalloc(sizeof(*cfg));
+	mode = obs_data_get_int(settings, KEY_MODE);
+	cfg->mode = (mode >= HDRP_MODE_SEQUENTIAL && mode <= HDRP_MODE_SHUFFLE)
+			    ? (int)mode
+			    : HDRP_MODE_SEQUENTIAL;
+	cfg->hw_decode = obs_data_get_bool(settings, KEY_HW_DECODE);
+	cfg->speed_percent = (int)obs_data_get_int(settings, KEY_SPEED);
+	cfg->use_transition = obs_data_get_bool(settings, KEY_USE_TRANSITION);
+	cfg->transition_ms = (int)obs_data_get_int(settings, KEY_TRANSITION_MS);
+	cfg->low_memory = obs_data_get_bool(settings, KEY_LOW_MEMORY);
+	cfg->visibility = (int)obs_data_get_int(settings, KEY_VISIBILITY);
+	cfg->mixed = (int)obs_data_get_int(settings, KEY_MIXED);
+	cfg->adapt_canvas = obs_data_get_bool(settings, KEY_ADAPT_CANVAS);
+	cfg->deinterlace_mode = (int)obs_data_get_int(settings, KEY_DEINTERLACE);
+	cfg->saved_index = obs_data_get_int(settings, KEY_SAVED_INDEX);
+
+	arr = obs_data_get_array(settings, KEY_FILES);
+	if (arr) {
+		size_t n = obs_data_array_count(arr);
+		if (n) {
+			cfg->files = bzalloc(n * sizeof(*cfg->files));
+			for (size_t i = 0; i < n; i++) {
+				obs_data_t *item = obs_data_array_item(arr, i);
+				const char *path = item
+					? obs_data_get_string(item, "value")
+					: NULL;
+				/* Skip blank rows: the old in-place list
+				 * loader ignored them too. */
+				if (path && *path)
+					cfg->files[cfg->count++] =
+						bstrdup(path);
+				if (item)
+					obs_data_release(item);
 			}
-
-			hdrp_playlist_add_folder(tmp, add_dir, 4);
-			added = hdrp_playlist_count(tmp);
-			for (size_t i = 0; i < added; i++) {
-				obs_data_t *it = obs_data_create();
-				obs_data_set_string(it, "value",
-						    hdrp_playlist_at(tmp, i));
-				obs_data_array_push_back(merged, it);
-				obs_data_release(it);
-			}
-			hdrp_playlist_destroy(tmp);
-
-			obs_data_set_array(settings, KEY_FILES, merged);
-			obs_data_array_release(merged);
-			obs_data_set_string(settings, KEY_ADD_FOLDER, "");
-			blog(LOG_INFO,
-			     "[HDR-PL] added %zu file(s) from folder '%s'",
-			     added, add_dir);
 		}
+		obs_data_array_release(arr);
 	}
 
-	if (files_list_changed(p, settings)) {
-		load_files_from_settings(p, settings);
-		list_changed = true;
-	}
-	hdrp_mutex_unlock(&p->mutex);
-
-	ms = (p->use_transition && !p->low_memory) ? p->transition_ms : 0;
-	hdrp_switcher_set_transition_ms(p->sw, ms);
-
-	/* Memory: without preloading the second decoder is destroyed and the
-	 * plugin runs a single ffmpeg instance. */
-	hdrp_switcher_set_preload_enabled(p->sw, !p->low_memory);
-	hdrp_switcher_set_deinterlace(p->sw, p->deinterlace_mode);
-
-	hdrp_sync_output_config(p);
-
-	if (list_changed)
-		hdrp_playlist_changed(p);
+	hdrp_post_config(p, cfg);
 }
 
 static void hdrp_save(void *data, obs_data_t *settings)
 {
-	struct hdr_playlist *p = data;
-	if (!p)
-		return;
-	hdrp_mutex_lock(&p->mutex);
+	struct hdrp_status st;
+
+	hdrp_status_snapshot(data, &st);
 	obs_data_set_int(settings, KEY_SAVED_INDEX,
-			 hdrp_playlist_has_current(p->pl)
-				 ? (long long)hdrp_playlist_current_index(p->pl)
-				 : -1);
-	hdrp_mutex_unlock(&p->mutex);
+			 st.has_current ? (long long)st.current_index : -1);
 }
 
 static void hdrp_show(void *data)
 {
-	struct hdr_playlist *p = data;
-	if (!p)
-		return;
-	p->showing = true;
-
-	if (p->stopped && hdrp_playlist_count(p->pl) > 0) {
-		if (p->visibility == VIS_STOP_NEXT)
-			hdrp_jump(p, true);
-		else
-			hdrp_start_current(p);
-		return;
-	}
-
-	if (p->visibility == VIS_PAUSE_RESUME && !p->stopped)
-		hdrp_switcher_set_paused(p->sw, false);
+	hdrp_post(data, HDRP_CMD_SHOW, 0);
 }
 
 static void hdrp_hide(void *data)
 {
-	struct hdr_playlist *p = data;
-	if (!p)
-		return;
-	p->showing = false;
-
-	if (p->visibility == VIS_ALWAYS_PLAY)
-		return;
-	if (p->visibility == VIS_PAUSE_RESUME) {
-		hdrp_switcher_set_paused(p->sw, true);
-		return;
-	}
-	hdrp_stop_playback(p);
+	hdrp_post(data, HDRP_CMD_HIDE, 0);
 }
 
 static void hdrp_activate(void *data)
 {
-	struct hdr_playlist *p = data;
-	if (!p)
-		return;
-	if (hdrp_playlist_count(p->pl) == 0 || !p->stopped)
-		return;
-	hdrp_start_current(p);
+	hdrp_post(data, HDRP_CMD_ACTIVATE, 0);
 }
 
 static void hdrp_video_tick(void *data, float seconds)
 {
 	struct hdr_playlist *p = data;
+	struct hdrp_config *cfg;
+
 	if (!p)
 		return;
+
+	/* First tick on this thread creates the crossfade effect and the
+	 * initial private media child (they must not be made on the UI
+	 * thread). Do this BEFORE any config or command can touch sw. */
+	hdrp_switcher_ensure_ready(p->sw);
+
+	/* Sole owner of all playback state: apply the newest settings first,
+	 * then run queued control requests, both before this frame's tick. */
+	cfg = hdrp_take_config(p);
+	if (cfg)
+		hdrp_apply_config(p, cfg);
+	hdrp_drain_commands(p);
 
 	hdrp_sync_output_config(p);
 	hdrp_switcher_tick(p->sw, seconds);
@@ -943,12 +1263,11 @@ static void hdrp_video_tick(void *data, float seconds)
 		 * actually plays now — otherwise "next" and the follow-up
 		 * preload keep working from a stale position and gapless mode
 		 * ends up replaying clips. */
-		const char *playing = hdrp_switcher_active_path(p->sw);
+		char *playing = hdrp_switcher_active_path_dup(p->sw);
 
 		if (playing) {
-			hdrp_mutex_lock(&p->mutex);
 			cursor_to_path(p, playing);
-			hdrp_mutex_unlock(&p->mutex);
+			bfree(playing);
 		}
 		hdrp_attach_audio_to_active(p);
 		p->need_preload_retry = true;
@@ -970,7 +1289,7 @@ static void hdrp_video_tick(void *data, float seconds)
 	if (!p->stopped) {
 		p->hb_seconds += seconds;
 		if (p->hb_seconds >= 5.0f) {
-			const char *path = hdrp_switcher_active_path(p->sw);
+			char *path = hdrp_switcher_active_path_dup(p->sw);
 			char *name = path ? hdrp_basename_dup(path) : NULL;
 			enum obs_media_state st = hdrp_switcher_get_state(p->sw);
 			int64_t pos = hdrp_switcher_get_time(p->sw);
@@ -994,6 +1313,7 @@ static void hdrp_video_tick(void *data, float seconds)
 				     "slow for this resolution]"
 				   : "");
 			bfree(name);
+			bfree(path);
 		}
 	} else {
 		p->hb_seconds = 0.0f;
@@ -1016,22 +1336,30 @@ static void hdrp_video_tick(void *data, float seconds)
 		p->decoders_closed = false;
 	}
 
-	/* Media info: the decoder only knows a clip's resolution / colour space
-	 * *after* it opened the file, and it can change mid-clip (audio track
-	 * appears, stream reconnects). Poll the info twice per second and refresh
-	 * the properties panel only when it actually changed — event driven,
-	 * never a per-second panel rebuild. */
-	p->info_check_seconds += seconds;
-	if (p->info_check_seconds >= 0.5f) {
-		char info[192];
+	/* Publish the frame's state for UI readers. This is the ONLY writer of
+	 * p->status, and everything it reads is video-thread-owned. */
+	{
+		struct hdrp_status st;
 
-		p->info_check_seconds = 0.0f;
-		hdrp_build_info_media(p, info, sizeof(info));
-		if (strcmp(info, p->info_cache) != 0) {
-			snprintf(p->info_cache, sizeof(p->info_cache), "%s",
-				 info);
-			hdrp_queue_props_refresh(p);
-			blog(LOG_INFO, "[HDR-PL] media: %s", info);
+		hdrp_compute_status(p, &st);
+		hdrp_publish_status(p, &st);
+
+		/* Media info: the decoder only knows a clip's resolution /
+		 * colour space *after* it opened the file, and it can change
+		 * mid-clip. Compare twice per second and refresh the
+		 * properties panel only when it actually changed. */
+		p->info_check_seconds += seconds;
+		if (p->info_check_seconds >= 0.5f) {
+			char info[192];
+
+			p->info_check_seconds = 0.0f;
+			hdrp_build_info_media(&st, info, sizeof(info));
+			if (strcmp(info, p->info_cache) != 0) {
+				snprintf(p->info_cache,
+					 sizeof(p->info_cache), "%s", info);
+				hdrp_queue_props_refresh(p);
+				blog(LOG_INFO, "[HDR-PL] media: %s", info);
+			}
 		}
 	}
 }
@@ -1072,13 +1400,18 @@ static void hdrp_enum_active_sources(void *data, obs_source_enum_proc_t cb,
 				     void *param)
 {
 	struct hdr_playlist *p = data;
-	obs_source_t *child;
+	obs_source_t *slots[2];
+
 	if (!p)
 		return;
+	/* Strong references keep the children alive for the whole enumeration,
+	 * even if the video thread releases an idle slot meanwhile. */
+	hdrp_switcher_slot_refs(p->sw, slots);
 	for (int i = 0; i < 2; i++) {
-		child = hdrp_switcher_slot(p->sw, i);
-		if (child)
-			cb(p->source, child, param);
+		if (slots[i]) {
+			cb(p->source, slots[i], param);
+			obs_source_release(slots[i]);
+		}
 	}
 }
 
@@ -1111,79 +1444,59 @@ hdrp_video_get_color_space(void *data, size_t count,
 	return hdrp_switcher_content_space(p->sw, count, preferred_spaces);
 }
 
+/* Media controls run on the UI thread: post, never act. */
 static void hdrp_media_play_pause(void *data, bool pause)
 {
-	struct hdr_playlist *p = data;
-	enum obs_media_state st;
-
-	if (!p)
-		return;
-	st = hdrp_switcher_get_state(p->sw);
-	if (pause) {
-		if (st == OBS_MEDIA_STATE_PLAYING)
-			hdrp_switcher_set_paused(p->sw, true);
-		return;
-	}
-	if (st == OBS_MEDIA_STATE_PAUSED) {
-		hdrp_switcher_set_paused(p->sw, false);
-		return;
-	}
-	hdrp_start_current(p);
+	hdrp_post(data, HDRP_CMD_PLAY_PAUSE, pause ? 1 : 0);
 }
 
 static void hdrp_media_restart(void *data)
 {
-	struct hdr_playlist *p = data;
-	if (p)
-		hdrp_start_current(p);
+	hdrp_post(data, HDRP_CMD_RESTART, 0);
 }
 
 static void hdrp_media_stop(void *data)
 {
-	struct hdr_playlist *p = data;
-	if (p)
-		hdrp_stop_playback(p);
+	hdrp_post(data, HDRP_CMD_STOP, 0);
 }
 
 static void hdrp_media_next(void *data)
 {
-	struct hdr_playlist *p = data;
-	if (p)
-		hdrp_jump(p, true);
+	hdrp_post(data, HDRP_CMD_NEXT, 0);
 }
 
 static void hdrp_media_previous(void *data)
 {
-	struct hdr_playlist *p = data;
-	if (p)
-		hdrp_jump(p, false);
+	hdrp_post(data, HDRP_CMD_PREV, 0);
 }
 
+/* Read-only media queries use the snapshot published by the video thread.
+ * A one-frame lag here is invisible in the UI and buys complete isolation
+ * from live switcher state. */
 static int64_t hdrp_media_get_duration(void *data)
 {
-	struct hdr_playlist *p = data;
-	return p ? hdrp_switcher_get_duration(p->sw) : 0;
+	struct hdrp_status st;
+	hdrp_status_snapshot(data, &st);
+	return st.duration_ms;
 }
 
 static int64_t hdrp_media_get_time(void *data)
 {
-	struct hdr_playlist *p = data;
-	return p ? hdrp_switcher_get_time(p->sw) : 0;
+	struct hdrp_status st;
+	hdrp_status_snapshot(data, &st);
+	return st.time_ms;
 }
 
 static void hdrp_media_set_time(void *data, int64_t ms)
 {
-	struct hdr_playlist *p = data;
-	if (p)
-		hdrp_switcher_seek(p->sw, ms);
+	hdrp_post(data, HDRP_CMD_SEEK, ms);
 }
 
 static enum obs_media_state hdrp_media_get_state(void *data)
 {
-	struct hdr_playlist *p = data;
-	if (!p || hdrp_playlist_count(p->pl) == 0 || p->stopped)
-		return OBS_MEDIA_STATE_STOPPED;
-	return hdrp_switcher_get_state(p->sw);
+	struct hdrp_status st;
+	hdrp_status_snapshot(data, &st);
+	return st.media_state;
 }
 
 static obs_missing_files_t *hdrp_missing_files(void *data)
@@ -1235,11 +1548,14 @@ static obs_properties_t *hdrp_properties(void *data)
 	/* Current clip / output info: read when the panel is built, and
 	 * refreshed on clip changes (never on a timer). */
 	{
+		struct hdrp_status st;
 		char info[256];
-		hdrp_build_info_media(data, info, sizeof(info));
+
+		hdrp_status_snapshot(data, &st);
+		hdrp_build_info_media(&st, info, sizeof(info));
 		obs_properties_add_text(props, "hdrp_info_media", info,
 					OBS_TEXT_INFO);
-		hdrp_build_info_output(data, info, sizeof(info));
+		hdrp_build_info_output(&st, info, sizeof(info));
 		obs_properties_add_text(props, "hdrp_info_output", info,
 					OBS_TEXT_INFO);
 	}

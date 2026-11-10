@@ -16,10 +16,15 @@
 #include <stdio.h>
 #include <string.h>
 
+/* util.h must come before the obs headers on Windows (it pulls in windows.h
+ * and defines our cross-platform mutex). */
+#include "util.h"
+
 #include <obs-module.h>
 #include <graphics/graphics.h>
 #include <graphics/vec4.h>
 #include <util/bmem.h>
+#include <util/threading.h>
 
 #include "playlist.h"
 #include "switcher.h"
@@ -57,9 +62,20 @@ static bool xfade_load(struct xfade *x)
 		     "plugin's data directory");
 		return false;
 	}
+	/* Every gs_* call — including the parameter and technique lookups —
+	 * must run inside the graphics context. The old code queried them
+	 * after obs_leave_graphics(), which is invalid on most backends. */
 	obs_enter_graphics();
 	x->effect = gs_effect_create_from_file(file, &error);
+	if (x->effect) {
+		x->tex_a = gs_effect_get_param_by_name(x->effect, "tex_a");
+		x->tex_b = gs_effect_get_param_by_name(x->effect, "tex_b");
+		x->fade = gs_effect_get_param_by_name(x->effect, "fade_val");
+		x->linear_tech =
+			!!gs_effect_get_technique(x->effect, "FadeLinear");
+	}
 	obs_leave_graphics();
+
 	if (!x->effect) {
 		blog(LOG_WARNING, "[HDR-PL] failed to compile '%s': %s", file,
 		     error ? error : "(no error reported)");
@@ -69,18 +85,12 @@ static bool xfade_load(struct xfade *x)
 	}
 	bfree(error);
 	bfree(file);
-	x->tex_a = gs_effect_get_param_by_name(x->effect, "tex_a");
-	x->tex_b = gs_effect_get_param_by_name(x->effect, "tex_b");
-	x->fade = gs_effect_get_param_by_name(x->effect, "fade_val");
 	if (!x->tex_a || !x->tex_b || !x->fade) {
 		blog(LOG_WARNING, "[HDR-PL] crossfade effect is missing one of "
 				  "tex_a/tex_b/fade_val");
 		xfade_free(x);
 		return false;
 	}
-	obs_enter_graphics();
-	x->linear_tech = !!gs_effect_get_technique(x->effect, "FadeLinear");
-	obs_leave_graphics();
 	return true;
 }
 
@@ -103,7 +113,17 @@ struct hdrp_switcher {
 	void *opaque;
 	void (*ended_cb)(void *opaque);
 
+	/* Guards the two heap strings and release_pending[]. NEVER held while
+	 * calling into libobs: a media/audio callback may already hold one of
+	 * libobs' internal locks, so nesting the two would deadlock. */
+	hdrp_mutex_t mtx;
+
 	obs_source_t *slot[2];
+	/* A control thread (properties/hotkeys) must not destroy a child that
+	 * the video thread may still be rendering. It only sets this flag; the
+	 * video thread performs the actual release at the start of a tick. */
+	bool release_pending[2];
+	bool ready; /* graphics effect + slot 0 created on the video thread */
 	int active_idx;  /* presented slot, -1 = none */
 	int preload_idx; /* parked slot, -1 = none */
 	bool preload_enabled; /* second decoder allowed to exist */
@@ -118,7 +138,12 @@ struct hdrp_switcher {
 	bool park_sent;       /* seek+pause already issued for this preload */
 	int preload_ticks;    /* watchdog against a preload that never parks */
 
-	volatile bool end_requested; /* media_ended fired for the active slot */
+	/* Written by the media_ended signal (media thread) with
+	 * os_atomic_set_long(), consumed by the video thread. A plain bool or
+	 * volatile is a data race in C; libobs' atomics also give us the
+	 * necessary memory barriers. This is the ONLY field the media thread
+	 * is allowed to touch. */
+	volatile long end_requested;
 	bool promote_event;
 
 	/* crossfade */
@@ -222,6 +247,11 @@ void hdrp_switcher_set_deinterlace(struct hdrp_switcher *sw, int mode)
 }
 
 
+/* Called from control threads (properties/hotkeys/media controls). Destroying
+ * a private child here is unsafe: the video thread may be inside
+ * video_render() or enum_active_sources() with that exact pointer. Instead we
+ * only mark the slot; drain_releases() does the destroy on the video thread.
+ * The child pointer stays valid in the meantime, so readers cannot fault. */
 static void release_slot(struct hdrp_switcher *sw, int idx)
 {
 	if (idx < 0 || idx > 1 || !sw->slot[idx])
@@ -229,13 +259,46 @@ static void release_slot(struct hdrp_switcher *sw, int idx)
 	if (sw->active_idx == idx)
 		return; /* never destroy the slot we are presenting */
 
-	obs_source_remove_active_child(sw->parent, sw->slot[idx]);
-	signal_handler_t *sh = obs_source_get_signal_handler(sw->slot[idx]);
-	signal_handler_disconnect(sh, "media_ended", on_media_ended, sw);
-	obs_source_release(sw->slot[idx]);
-	sw->slot[idx] = NULL;
-	blog(LOG_INFO, "[HDR-PL] released idle decoder slot %d to save memory",
-	     idx);
+	hdrp_mutex_lock(&sw->mtx);
+	if (!sw->release_pending[idx]) {
+		sw->release_pending[idx] = true;
+		blog(LOG_INFO, "[HDR-PL] queued idle decoder slot %d for "
+			       "release on the video thread", idx);
+	}
+	hdrp_mutex_unlock(&sw->mtx);
+}
+
+/* Runs at the start of video_tick(), and once from destroy() (libobs defers
+ * destroy until it is not inside a tick, see obs_source_destroy_defer). */
+static void drain_releases(struct hdrp_switcher *sw)
+{
+	for (int i = 0; i < 2; i++) {
+		bool pending;
+		obs_source_t *child = NULL;
+
+		hdrp_mutex_lock(&sw->mtx);
+		pending = sw->release_pending[i];
+		sw->release_pending[i] = false;
+		/* Detach the pointer under the SAME lock the enumerator uses
+		 * to take strong references. Once slot[i] is NULL nobody can
+		 * obtain a new reference to this child; any reference taken
+		 * before this point keeps it alive until the enumerator is
+		 * done with cb(). */
+		if (pending && sw->active_idx != i) {
+			child = sw->slot[i];
+			sw->slot[i] = NULL;
+		}
+		hdrp_mutex_unlock(&sw->mtx);
+
+		if (!child)
+			continue;
+
+		obs_source_remove_active_child(sw->parent, child);
+		signal_handler_t *sh = obs_source_get_signal_handler(child);
+		signal_handler_disconnect(sh, "media_ended", on_media_ended, sw);
+		obs_source_release(child);
+		blog(LOG_INFO, "[HDR-PL] released idle decoder slot %d", i);
+	}
 }
 
 void hdrp_switcher_set_preload_enabled(struct hdrp_switcher *sw, bool enable)
@@ -243,8 +306,15 @@ void hdrp_switcher_set_preload_enabled(struct hdrp_switcher *sw, bool enable)
 	if (!sw)
 		return;
 	sw->preload_enabled = enable;
-	if (enable)
+	if (enable) {
+		/* A disable/enable within the same frame must not leave a
+		 * stale destruction queued for the slot we are about to reuse. */
+		hdrp_mutex_lock(&sw->mtx);
+		sw->release_pending[0] = false;
+		sw->release_pending[1] = false;
+		hdrp_mutex_unlock(&sw->mtx);
 		return;
+	}
 
 	hdrp_switcher_drop_preload(sw);
 	sw->xfade_active = false;
@@ -255,12 +325,14 @@ void hdrp_switcher_set_preload_enabled(struct hdrp_switcher *sw, bool enable)
 static void on_media_ended(void *data, calldata_t *cd)
 {
 	struct hdrp_switcher *sw = data;
-	obs_source_t *src = NULL;
-	if (!sw || sw->active_idx < 0)
-		return;
-	calldata_get_ptr(cd, "source", &src);
-	if (src == sw->slot[sw->active_idx])
-		sw->end_requested = true;
+	UNUSED_PARAMETER(cd);
+
+	/* Media thread: touch NOTHING but the atomic flag. Reading active_idx
+	 * or slot[] here used to race with promote()/stop() on the video
+	 * thread. play()/stop()/promote() clear the flag, so a late signal
+	 * from a clip that is no longer current is discarded as before. */
+	if (sw)
+		os_atomic_set_long(&sw->end_requested, 1);
 }
 
 static void slot_update_settings(obs_source_t *child, const char *path,
@@ -318,6 +390,8 @@ hdrp_switcher_create(obs_source_t *parent, void *opaque,
 		     void (*cb)(void *opaque))
 {
 	struct hdrp_switcher *sw = bzalloc(sizeof(*sw));
+	hdrp_mutex_init(&sw->mtx);
+	os_atomic_set_long(&sw->end_requested, 0);
 	sw->parent = parent;
 	sw->opaque = opaque;
 	sw->ended_cb = cb;
@@ -327,17 +401,32 @@ hdrp_switcher_create(obs_source_t *parent, void *opaque,
 	sw->xf_tex_fmt = GS_RGBA;
 	sw->opts.hw_decode = true;
 	sw->opts.speed_percent = 100;
+	sw->preload_enabled = true;
+
+	/* create() runs on the UI thread. Loading a graphics effect and
+	 * creating private media children here would enter the graphics
+	 * context and mutate obs->data.sources while the video thread is
+	 * rendering. Defer both to hdrp_switcher_ensure_ready() on the
+	 * video thread. */
+	return sw;
+}
+
+/* Video thread, at the top of every tick. Idempotent after the first call. */
+void hdrp_switcher_ensure_ready(struct hdrp_switcher *sw)
+{
+	if (!sw || sw->ready)
+		return;
+	sw->ready = true;
+
 	sw->xf_supported = xfade_load(&sw->xf);
 	if (!sw->xf_supported)
 		blog(LOG_INFO, "[HDR-PL] crossfade effect unavailable; "
 			       "switching uses hard cuts");
 
-	/* Only the presenting decoder is created up front. The second one is
-	 * instantiated on the first preload and destroyed again when the owner
-	 * disables preloading (low-memory mode). */
-	sw->preload_enabled = true;
+	/* Only the presenting decoder is created up front; the second one is
+	 * instantiated on the first preload. If obs-ffmpeg was not available
+	 * yet, hdrp_switcher_play() retries ensure_slot() later. */
 	ensure_slot(sw, 0);
-	return sw;
 }
 
 static void xf_texrender_release(struct hdrp_switcher *sw)
@@ -358,6 +447,10 @@ void hdrp_switcher_destroy(struct hdrp_switcher *sw)
 {
 	if (!sw)
 		return;
+
+	/* Flush any deferred child release before we tear down the mutex. */
+	drain_releases(sw);
+
 	if (sw->xf_tex[0] || sw->xf_tex[1]) {
 		obs_enter_graphics();
 		xf_texrender_release(sw);
@@ -365,16 +458,24 @@ void hdrp_switcher_destroy(struct hdrp_switcher *sw)
 	}
 	xfade_free(&sw->xf);
 	for (int i = 0; i < 2; i++) {
-		if (!sw->slot[i])
-			continue;
-		obs_source_remove_active_child(sw->parent, sw->slot[i]);
-		signal_handler_t *sh = obs_source_get_signal_handler(sw->slot[i]);
-		signal_handler_disconnect(sh, "media_ended", on_media_ended, sw);
-		obs_source_release(sw->slot[i]);
+		obs_source_t *child;
+
+		/* Detach under the same lock the enumerator uses. */
+		hdrp_mutex_lock(&sw->mtx);
+		child = sw->slot[i];
 		sw->slot[i] = NULL;
+		hdrp_mutex_unlock(&sw->mtx);
+		if (!child)
+			continue;
+
+		obs_source_remove_active_child(sw->parent, child);
+		signal_handler_t *sh = obs_source_get_signal_handler(child);
+		signal_handler_disconnect(sh, "media_ended", on_media_ended, sw);
+		obs_source_release(child);
 	}
 	bfree(sw->active_path);
 	bfree(sw->preload_path);
+	hdrp_mutex_destroy(&sw->mtx);
 	bfree(sw);
 }
 
@@ -384,6 +485,9 @@ void hdrp_switcher_destroy(struct hdrp_switcher *sw)
 
 static void clear_preload(struct hdrp_switcher *sw)
 {
+	/* Called from both control and video threads. Keep the free/clear pair
+	 * atomic with respect to any reader of preload_path. */
+	hdrp_mutex_lock(&sw->mtx);
 	sw->preload_pending = false;
 	sw->preload_ready = false;
 	sw->park_sent = false;
@@ -391,6 +495,7 @@ static void clear_preload(struct hdrp_switcher *sw)
 	sw->preload_idx = -1;
 	bfree(sw->preload_path);
 	sw->preload_path = NULL;
+	hdrp_mutex_unlock(&sw->mtx);
 }
 
 bool hdrp_switcher_play(struct hdrp_switcher *sw, const char *path,
@@ -410,11 +515,13 @@ bool hdrp_switcher_play(struct hdrp_switcher *sw, const char *path,
 
 	slot_update_settings(child, path, opts);
 	sw->opts = *opts;
+	hdrp_mutex_lock(&sw->mtx);
 	bfree(sw->active_path);
 	sw->active_path = bstrdup(path);
+	hdrp_mutex_unlock(&sw->mtx);
 
 	clear_preload(sw);
-	sw->end_requested = false;
+	os_atomic_set_long(&sw->end_requested, 0);
 	sw->xfade_active = false;
 	sw->xfade_out_idx = -1;
 	return true;
@@ -425,6 +532,7 @@ bool hdrp_switcher_preload(struct hdrp_switcher *sw, const char *path,
 {
 	int idle;
 	obs_source_t *child;
+	bool already;
 
 	if (!sw || !path || !*path)
 		return false;
@@ -435,8 +543,12 @@ bool hdrp_switcher_preload(struct hdrp_switcher *sw, const char *path,
 	child = ensure_slot(sw, idle);
 	if (!child)
 		return false;
-	if (sw->preload_idx == idle && sw->preload_path &&
-	    strcmp(sw->preload_path, path) == 0)
+
+	hdrp_mutex_lock(&sw->mtx);
+	already = sw->preload_idx == idle && sw->preload_path &&
+		  strcmp(sw->preload_path, path) == 0;
+	hdrp_mutex_unlock(&sw->mtx);
+	if (already)
 		return true;
 
 	clear_preload(sw);
@@ -444,8 +556,10 @@ bool hdrp_switcher_preload(struct hdrp_switcher *sw, const char *path,
 	obs_source_media_stop(child);
 	slot_update_settings(child, path, opts);
 
+	hdrp_mutex_lock(&sw->mtx);
 	sw->preload_idx = idle;
 	sw->preload_path = bstrdup(path);
+	hdrp_mutex_unlock(&sw->mtx);
 	sw->preload_opts = *opts;
 	sw->preload_pending = true;
 	return true;
@@ -470,11 +584,13 @@ void hdrp_switcher_stop(struct hdrp_switcher *sw)
 	}
 	clear_preload(sw);
 	sw->active_idx = -1;
-	sw->end_requested = false;
+	os_atomic_set_long(&sw->end_requested, 0);
 	sw->xfade_active = false;
 	sw->xfade_out_idx = -1;
+	hdrp_mutex_lock(&sw->mtx);
 	bfree(sw->active_path);
 	sw->active_path = NULL;
+	hdrp_mutex_unlock(&sw->mtx);
 }
 
 void hdrp_switcher_unload(struct hdrp_switcher *sw)
@@ -543,9 +659,20 @@ enum obs_media_state hdrp_switcher_get_state(struct hdrp_switcher *sw)
 	return obs_source_media_get_state(sw->slot[sw->active_idx]);
 }
 
-const char *hdrp_switcher_active_path(const struct hdrp_switcher *sw)
+/* Returns a bstrdup'd copy; the caller owns it and must bfree() it.
+ * active_path is freed/rewired on the video thread while UI threads read it,
+ * so exposing the raw pointer was a use-after-free. */
+char *hdrp_switcher_active_path_dup(struct hdrp_switcher *sw)
 {
-	return sw ? sw->active_path : NULL;
+	char *copy = NULL;
+
+	if (!sw)
+		return NULL;
+	hdrp_mutex_lock(&sw->mtx);
+	if (sw->active_path)
+		copy = bstrdup(sw->active_path);
+	hdrp_mutex_unlock(&sw->mtx);
+	return copy;
 }
 
 obs_source_t *hdrp_switcher_active_child(const struct hdrp_switcher *sw)
@@ -555,11 +682,25 @@ obs_source_t *hdrp_switcher_active_child(const struct hdrp_switcher *sw)
 	return sw->slot[sw->active_idx];
 }
 
-obs_source_t *hdrp_switcher_slot(const struct hdrp_switcher *sw, int idx)
+void hdrp_switcher_slot_refs(struct hdrp_switcher *sw, obs_source_t *out[2])
 {
-	if (!sw || idx < 0 || idx > 1)
-		return NULL;
-	return sw->slot[idx];
+	obs_source_t *a, *b;
+
+	if (!sw) {
+		out[0] = NULL;
+		out[1] = NULL;
+		return;
+	}
+	/* Take strong references while holding the lock that drain_releases()
+	 * uses to detach slots. obs_source_get_ref() is a plain atomic refcount
+	 * increment and takes no libobs locks, so it cannot deadlock. The
+	 * caller must obs_source_release() each non-NULL entry. */
+	hdrp_mutex_lock(&sw->mtx);
+	a = sw->slot[0];
+	b = sw->slot[1];
+	out[0] = a ? obs_source_get_ref(a) : NULL;
+	out[1] = b ? obs_source_get_ref(b) : NULL;
+	hdrp_mutex_unlock(&sw->mtx);
 }
 
 void hdrp_switcher_set_output_size(struct hdrp_switcher *sw, uint32_t w,
@@ -670,6 +811,9 @@ static void promote(struct hdrp_switcher *sw)
 
 	sw->active_idx = new_idx;
 	sw->opts = sw->preload_opts;
+	/* Hand the string over atomically: a control thread calling
+	 * active_path_dup() must never observe a freed or half-swapped pair. */
+	hdrp_mutex_lock(&sw->mtx);
 	bfree(sw->active_path);
 	sw->active_path = sw->preload_path;
 	sw->preload_path = NULL;
@@ -678,7 +822,8 @@ static void promote(struct hdrp_switcher *sw)
 	sw->preload_ready = false;
 	sw->park_sent = false;
 	sw->preload_ticks = 0;
-	sw->end_requested = false;
+	hdrp_mutex_unlock(&sw->mtx);
+	os_atomic_set_long(&sw->end_requested, 0);
 
 	if (do_xf) {
 		sw->xfade_active = true;
@@ -703,6 +848,10 @@ void hdrp_switcher_tick(struct hdrp_switcher *sw, float seconds)
 
 	if (!sw)
 		return;
+
+	/* Perform any child destruction queued by a control thread. From here
+	 * on this frame no other thread can invalidate slot[] pointers. */
+	drain_releases(sw);
 
 	/* Note: the children do NOT need (and must not) be ticked by us.
 	 * libobs' tick_sources() walks every source in obs->data.sources —
@@ -751,8 +900,9 @@ void hdrp_switcher_tick(struct hdrp_switcher *sw, float seconds)
 	}
 
 	/* --- 2. react to the end of the active clip --- */
-	if (sw->end_requested) {
-		sw->end_requested = false;
+	/* os_atomic_set_long() returns the previous value, so this is an atomic
+	 * test-and-clear. No torn read / lost wakeup against the media thread. */
+	if (os_atomic_set_long(&sw->end_requested, 0)) {
 		if (sw->preload_ready) {
 			promote(sw);
 		} else if (sw->ended_cb && sw->opaque) {

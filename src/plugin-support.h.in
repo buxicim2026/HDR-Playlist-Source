@@ -13,8 +13,11 @@
 /* OBS source id registered by this plugin. */
 #define HDRP_SOURCE_ID     "hdr_playlist_source"
 
-/* Minimum OBS semantic version: 30.0.0. Everything this plugin uses (color
- * space API, gs_texrender_begin_with_color_space, media controls) exists in
- * OBS 30; older versions are untested. libobs encodes versions as
+/* Minimum OBS semantic version: 31.0.0. This module is compiled and packaged
+ * against the 31.0.0 headers (CI OBS_VERSION=31.0.0) and calls APIs such as
+ * gs_texrender_begin_with_color_space() / gs_effect_set_texture_srgb(). It is
+ * deliberately NOT linked against a real libobs on Linux/macOS, so there is
+ * no link-time ABI check — loading on an older OBS must be refused rather
+ * than resolving mismatched symbols at runtime. libobs encodes versions as
  * (major<<24)|(minor<<16)|(patch<<8). */
-#define HDRP_MIN_OBS_VERSION ((30u << 24) | (0u << 16) | (0u << 8))
+#define HDRP_MIN_OBS_VERSION ((31u << 24) | (0u << 16) | (0u << 8))

@@ -2,6 +2,15 @@
  * util.c — small cross-platform helpers (mutex + path utilities).
  */
 
+#ifndef _WIN32
+/* PTHREAD_MUTEX_RECURSIVE is hidden behind feature-test macros when the
+ * compiler runs in strict ANSI mode (-std=c11). Must be set before any
+ * system header is included. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,9 +27,24 @@
 void hdrp_mutex_init(hdrp_mutex_t *m)
 {
 #ifdef _WIN32
+	/* CRITICAL_SECTION is already recursive on Windows. */
 	InitializeCriticalSection(m);
 #else
-	pthread_mutex_init(m, NULL);
+	/* Make pthread mutexes recursive too: several owners legitimately
+	 * re-enter through nested helpers (e.g. switcher play -> clear_preload,
+	 * audio destroy -> detach). */
+	pthread_mutexattr_t attr;
+	if (pthread_mutexattr_init(&attr) == 0) {
+#if defined(PTHREAD_MUTEX_RECURSIVE)
+		pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+#elif defined(PTHREAD_MUTEX_RECURSIVE_NP)
+		pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE_NP);
+#endif
+		pthread_mutex_init(m, &attr);
+		pthread_mutexattr_destroy(&attr);
+	} else {
+		pthread_mutex_init(m, NULL);
+	}
 #endif
 }
 

@@ -35,6 +35,11 @@ struct hdrp_switcher *hdrp_switcher_create(obs_source_t *parent, void *opaque,
 					   void (*cb)(void *opaque));
 void hdrp_switcher_destroy(struct hdrp_switcher *sw);
 
+/* VIDEO THREAD ONLY, called at the top of video_tick(). Creates the
+ * crossfade effect and the first private media child, which must not be
+ * created on the UI thread (create() runs there). Idempotent. */
+void hdrp_switcher_ensure_ready(struct hdrp_switcher *sw);
+
 /* ------------------------------------------------------------------ */
 /* control (owner thread)                                              */
 /* ------------------------------------------------------------------ */
@@ -56,10 +61,16 @@ int64_t hdrp_switcher_get_time(struct hdrp_switcher *sw);
 int64_t hdrp_switcher_get_duration(struct hdrp_switcher *sw);
 enum obs_media_state hdrp_switcher_get_state(struct hdrp_switcher *sw);
 
-const char *hdrp_switcher_active_path(const struct hdrp_switcher *sw);
+/* Path of the clip currently presented. Returns a bstrdup'd copy owned by
+ * the caller (bfree it); never returns a pointer into the switcher, because
+ * the switcher replaces/frees it on the video thread. */
+char *hdrp_switcher_active_path_dup(struct hdrp_switcher *sw);
 obs_source_t *hdrp_switcher_active_child(const struct hdrp_switcher *sw);
-/* Slot access for enum_active_sources(): idx must be 0 or 1, may be NULL. */
-obs_source_t *hdrp_switcher_slot(const struct hdrp_switcher *sw, int idx);
+/* Take a strong reference to each child under the switcher lock, for
+ * enum_active_sources(). libobs may enumerate from a thread other than
+ * video_tick(), so a bare pointer snapshot could be released while cb() is
+ * running. The caller must obs_source_release() every non-NULL entry. */
+void hdrp_switcher_slot_refs(struct hdrp_switcher *sw, obs_source_t *out[2]);
 
 /* ------------------------------------------------------------------ */
 /* per-frame (video thread)                                            */
